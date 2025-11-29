@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
 	if (connect(clientSocket, (SOCKADDR*)&clientService, sizeof(clientService)) == SOCKET_ERROR) {
 		std::cout << "Failed to connect to server" << std::endl;
 		WSACleanup();
-		return 0;
+		return 0; 
 	}
 	else {
 		std::cout << "Client connection success" << std::endl;
