@@ -1,36 +1,56 @@
 #include "stdafx.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include "iostream"
+
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <memory>
+#include <cassert>
+
 
 #pragma comment(lib, "Ws2_32.lib");
 
+enum class OperationType : uint32_t {
+	READ = 1,
+	WRITE = 2
+};
+
+void print_wsa_error(const char* msg) {
+	int err = WSAGetLastError();
+	std::cerr << msg << " WSAGetLastError = " << err "\n";
+}
+
 int main(int argc, char *argv[]) {
-	SOCKET serverSocket, acceptSocket;
-	int port = 5555;
+	// Initializing winsock.
 	WSADATA wsaData;
-	int wsaerr;
 	WORD wVersionRequested = MAKEWORD(2, 2);
-	wserr = WSAStartup(wVersionRequested, &wsaData);
+	int wsaerr = WSAStartup(wVersionRequested, &wsaData);
 	if (wsaerr != 0) {
 		std::cout << "Winsock dll not found" << std::endl;
 		return 0;
 	}
 	else {
-		std::cout << "Winsock dll found" << endl;
+		std::cout << "Winsock dll initialized" << std::endl;
 		std::cout << "Status: " << wsaData.szSystemStatus << std::endl;
 	}
-	return 0;
-
-	serverSocket = INVALID_SOCKET;
-	serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (serverSocket == INVALID_SOCKET) {
-		std::cout << "Error at socket(): " << WSAGetLastError() << std::endl;
+	
+	// Initializing a listening socket.
+	SOCKET listenSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, 0);
+	if (listenSocket == INVALID_SOCKET) {
+		std::cout << "Error creating listening socket" << WSAGetLastError() << std::endl;
 		WSACleanup();
 		return 0;
 	}
 	else {
 		std::cout << "socket (unbounded) setup success" << std::endl;
+	}
+
+	// allow for resuse immediately without the general 2MSL TIME_WAIT, bypass the TIME_WAIT protection
+	BOOL reuse = TRUE;
+	if (setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(resuse)) == SOCKET_ERROR) {
+		print_wsa_error("setsockopt(SO_REUSEADDR failed");
 	}
 
 	sockaddr_in service;
