@@ -12,7 +12,7 @@
 
 #pragma comment(lib, "Ws2_32.lib");
 
-constexpr int WORKER_THREADS = 0;   // we can use our custom number of worker threads
+constexpr int WORKER_THREADS = 0;   // we can use our custom number of worker threads here
 
 enum class OpType : uint32_t {
 	READ = 1,
@@ -53,6 +53,36 @@ struct PER_IO_OPERATION_DATA {
 		}
 	}
 };
+
+PER_IO_OPERATION_DATA* post_send(PER_SOCKET_CONTEXT* sockCtx, const char* data, DWORD len) {
+	auto* ioData = new PER_IO_OPERATION_DATA(OpType::WRITE);
+	ioData->buffer = new char[len];
+	memcpy(ioData->buffer, data, len);
+	ioData->wsaBuf.buf = ioData->buffer;
+	ioData->wsaBuf.len = len;
+	ZeroMemory(&ioData->overlapped, sizeOf(ioData->overlapped));
+
+	DWORD bytesSent = 0;
+	int rc = WSASend(
+		sockCtx->socket,
+		&ioData->wsaBuf,
+		1,
+		&bytesSent,
+		0,  
+		nullptr            // overlapped is nullptr so this is blocking right now.
+	);
+
+	// if SOCKET_ERROR, then it could be WSA_IO_PENDING which is asynchronous but okay
+	if (rc == SOCKET_ERROR) {
+		int err = WSAGetLastError();
+		if (err != WSA_IO_PENDING) {
+			print_wsa_error("WSASend failed");
+			delete ioData;
+			return nullptr;
+		}
+	}
+	return ioData;
+}
 
 
 int main(int argc, char *argv[]) {
@@ -153,10 +183,17 @@ int main(int argc, char *argv[]) {
 					if (overlapped == nullptr) {
 						// could be the condition that the main thread wanted to wake up this worker thread to signal stop
 						// so we break out of the loop
+
 						if (!running.load()) break;
 						// if not, log the warning and continue the next iteration of the while loop
 						std::cerr << "Failed with no overlapped: " << err << std::endl;
 						continue;
+					}
+					else {
+						// I/O operation failed, if cleanup thread deleted sockCtx, we will delete socket's pending operations' context
+						if (ioData != nullptr) {
+							delete ioData;
+						}
 					}
 					// log error
 					std::cerr << "I/O operation failed on socket, " << err << std::endl;
@@ -171,6 +208,27 @@ int main(int argc, char *argv[]) {
 
 				// final check before proceeding
 				assert(sockCtx != nullPtr && ioData != nullptr);
+
+
+				// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
+				// Here, we close the socket operations, deallocate memory
+				if (bytesTransferred == 0 && ioData->opTpye == OpType::READ) {
+					std::cout << "client disconnected" << std::endl;
+					// signal closing. .exhchange changes the atomic variable and returns prev value
+					if (!sockCtx->closing.exchange(true)) {
+						closeSocket(sockCtx->socket);
+						delete sockCtx;
+					}
+					delete ioData;
+					continue;
+				}
+
+				if (ioData->opType == OpType::READ) {
+					std::cout << "Read" << bytesTransferred << " bytes from client" << std:endl;
+
+					// currently blocking, see the implementation as top.
+					post_send(sockCtx, ioData->buffer, bytesTransferred);
+				}
 
 
 			}
