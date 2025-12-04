@@ -104,7 +104,8 @@ PER_IO_OPERATION_DATA* post_send(PER_SOCKET_CONTEXT* sockCtx, const char* data, 
 		1,
 		&bytesSent,
 		0,  
-		nullptr            // overlapped is nullptr so this is blocking right now.
+		&ioData->overlapped,   // if overlapped was nullptr this would be blocking 
+		nullptr            
 	);
 
 	// if SOCKET_ERROR, then it could be WSA_IO_PENDING which is asynchronous but okay
@@ -192,7 +193,7 @@ int main(int argc, char *argv[]) {
 	std::cout << "Starting " << numWorkers << " worker threads" << endl;
 
 	for (unsigned int i = 0; i < numWorkers; i++) {
-		workers.emplace_back([iocp, &running]()) {
+		workers.emplace_back([iocp, &running]() {
 			while (running.load()) {
 				DWORD bytesTransferred = 0;
 				ULONG_PTR completionKey = 0;
@@ -261,10 +262,10 @@ int main(int argc, char *argv[]) {
 				if (ioData->opType == OpType::READ) {
 					std::cout << "Read" << bytesTransferred << " bytes from client" << std:endl;
 
-					// currently blocking, see the implementation as top.
+					// non blocking, see the implementation as top.
 					post_send(sockCtx, ioData->buffer, bytesTransferred);
 
-					// another receive, this is non blocking unlike post_send
+					// another receive, this is non blocking
 					PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
 					if (!nextRecv) {
 						std::cerr << "Failed to post receive, closing client." << endl;
@@ -275,10 +276,17 @@ int main(int argc, char *argv[]) {
 					}
 					delete ioData;
 				}
-
+				else if (ioData->opType == OpType::WRITE) {
+					std::cout << "Write complete: " << bytesTransferred << std::endl;
+					delete ioData;
+				}
+				else {
+					std::cerr << "Unknown OpType" << std::endl;
+					delete ioData;
+				}
 
 			}
-		}
+		});
 	}
 
 
