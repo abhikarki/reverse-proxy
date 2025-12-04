@@ -14,7 +14,7 @@
 
 constexpr int WORKER_THREADS = 0;   // we can use our custom number of worker threads
 
-enum class OperationType : uint32_t {
+enum class OpType : uint32_t {
 	READ = 1,
 	WRITE = 2
 };
@@ -31,6 +31,28 @@ void print_wsa_error(const char* msg) {
 	std::cerr << msg << " WSAGetLastError = " << err "\n";
 }
 
+
+struct PER_IO_OPERATION_DATA {
+	OVERLAPPED overlapped;
+	WSABUF wsaBuf;
+	char* buffer;
+	OpType opType;
+	DWORD flags;
+	// Constructor
+	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0) {
+		// set all members of overlapped to zero
+		ZeroMemory(&overlapped, sizeof(overlapped));
+		wsaBuf.buf = nullptr;
+		wsaBuf.len = 0;
+	}
+	// Destructor
+	~PER_IO_OPERATION_DATA() {
+		if (buffer) {
+			delete[] buffer;
+			buffer = nullptr;
+		}
+	}
+};
 
 
 int main(int argc, char *argv[]) {
@@ -119,6 +141,36 @@ int main(int argc, char *argv[]) {
 					&overlapped,
 					INFINITE
 				)
+
+				// take the raw bytes in the completionKey and turn it back to a socket context
+				PER_SOCKET_CONTEXT * sockCtx = reinterpret_cast<PER_SOCKET_CONTEXT*>(completionKey);
+				
+				// the overlapped is the first member, so we can take it as the start of the PER_IO_OPERATION_DATA
+				PER_IO_OPERATION_DATA* ioData = reinterpret_cast<PER_IO_OPERATION_DATA*>(overlapped);
+
+				// checking the result for the GetQueuedCompletionStatus
+				if (!ok) {
+					if (overlapped == nullptr) {
+						// could be the condition that the main thread wanted to wake up this worker thread to signal stop
+						// so we break out of the loop
+						if (!running.load()) break;
+						// if not, log the warning and continue the next iteration of the while loop
+						std::cerr << "Failed with no overlapped: " << err << std::endl;
+						continue;
+					}
+					// log error
+					std::cerr << "I/O operation failed on socket, " << err << std::endl;
+				}
+
+				// in case the ok is true but the main thread might call PostQueuedCompletionStatus to signal stop
+				if (overlapped == nullptr) {
+					if (!running.load()) break;
+					// else continue to next iteration.
+					continue;
+				}
+
+				// final check before proceeding
+				assert(sockCtx != nullPtr && ioData != nullptr);
 
 
 			}
