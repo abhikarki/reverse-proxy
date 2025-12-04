@@ -12,7 +12,9 @@
 
 #pragma comment(lib, "Ws2_32.lib");
 
+constexpr unsigned short LISTEN_PORT = 8080;
 constexpr int WORKER_THREADS = 0;   // we can use our custom number of worker threads here
+constexpr int BUF_SIZE = 16 * 1024  // 16 KB
 
 enum class OpType : uint32_t {
 	READ = 1,
@@ -53,6 +55,39 @@ struct PER_IO_OPERATION_DATA {
 		}
 	}
 };
+
+PER_IO_OPERATION_DATA* post_recv(PER_SOCKET_CONTEXT* sockCtx) {
+	auto* ioData = new PER_IO_OPERATION_DATA(OpType::READ);
+	ioData->buffer = new char[BUF_SIZE];
+	ioData->wsaBuf.buf = ioData->buffer;
+	ioData->wsaBuf.len = BUF_SIZE;
+	ioData->flags = 0;
+	ZeroMemory(&ioData->overlapped, sizeof(ioData->overlapped));
+
+	DWORD bytesReceived = 0;
+	int rc = WSARecv(
+		sockCtx->socket,
+		&ioData->wsaBuf,
+		1,
+		&bytesReceived,
+		&ioData->flags,
+		&ioData->overlapped,    // this makes it asynchronous and return immediately
+		nullptr
+	);
+
+	if (rc == SOCKET_ERROR) {
+		int err = WSAGetLastError();
+		if (err != WSA_IO_PENDING) {
+			print_wsa_error("WSARecv failed");
+			delete ioData;
+			return nullptr;
+		}
+	}
+	// successfully posted receive
+	return ioData;
+}
+
+
 
 PER_IO_OPERATION_DATA* post_send(PER_SOCKET_CONTEXT* sockCtx, const char* data, DWORD len) {
 	auto* ioData = new PER_IO_OPERATION_DATA(OpType::WRITE);
@@ -228,6 +263,17 @@ int main(int argc, char *argv[]) {
 
 					// currently blocking, see the implementation as top.
 					post_send(sockCtx, ioData->buffer, bytesTransferred);
+
+					// another receive, this is non blocking unlike post_send
+					PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
+					if (!nextRecv) {
+						std::cerr << "Failed to post receive, closing client." << endl;
+						if (!sockCtx->closing.exchange(true)) {
+							closesocket(sockCtx->socket);
+							delete sockCtx;
+						}
+					}
+					delete ioData;
 				}
 
 
