@@ -289,41 +289,80 @@ int main(int argc, char *argv[]) {
 		});
 	}
 
+	// creating a listeining thread
+	std::thread listener([listenSocket, iocp, &running]() {
+		while (running.load()) {
+			sockaddr_in clientAddr{};
+			int addrLen = sizeof(clientAddr);
+			//blocking 
+			SOCKET clientSock = accept(listenSocket, (sockaddr*)&clientAddr, &addrLen);
+			if (clientSock == INVALID_SOCKET) {
+				int err = WSAGetLastError();
+				if (err == WSAEINTR) {
+					continue;    // interrupt
+				}
+				print_wsa_error("accept failed");
+				continue;
+			}
+
+			// to hold client's IP and port. NI_MAXHOST, NI_MAXSERV- system defined constants for size
+			char host[NI_MAXHOST], serv[NI_MAXSERV];
+
+			// get client info. flags to prevent the resolving into name
+			if (getnameinfo((sockaddr*)&clientAddr, addrLen, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+				std::cout << "Accepted connection from " << host << ":" << serv << std::endl;
+			}
+			else {
+				std::cout << "Accepted connection, failed to get info" << std::endl;
+			}
+
+			// disabling the Nagle delay
+			BOOL noDelay = TRUE;
+			setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
+			// initializing socket context
+			PER_SOCKET_CONTEXT* sockCtx = new PER_SOCKET_CONTEXT(clientSock);
+
+			if (!CreateIoCompletionPort((HANDLE)clientSock, iocp, (ULONG_PTR)sockCtx, 0)) {
+				print_wsa_error("CreateIoCompletionPort associating the client failed");
+				closeSocket(clientSock);
+				delete sockCtx;
+				continue;
+			}
+
+			PER_IO_OPERATION_DATA* recvOp = post_recv(sockCtx);
+			if (!recvOp) {
+				std::cerr << "Failed to post initial receive, closing client" << std::endl;
+				closesocket(clientSock);
+				delete sockCtx;
+				continue;
+			}
+
+		}
 
 
+		});
+	
+	std::cout << "Press any key to stop server: ";
+	std::cin.get();
+	std::cout << "Shutting down...";
 
+	running.store(false);
 
-	sockaddr_in service;
-	service.sin_family = AF_NET;
-	InetPton(AF_NET, _T("127.0.0.1"), &service.sin_addr.s_addr);
-	service.sin_port = htons(port);
-	if (bind(serverSocket, (SOCKADDR*)&service, sizeof(service)) == SOCKET_ERROR) {
-		std::cout << "socket binding failed: " << WSAGetLastError() << std::endl;
-		closeSocket(serverSocket);
-		WSACleanup();
-		return 0;
+	closesocket(listenSocket);
+
+	// post completion to wakeup worker threads.
+	for (size_t i = 0; i < workers.size(); i++) {
+		PostQueuedCompletionStatus(iocp, 0, 0, nullptr);
 	}
-	else {
-		std::cout << "Socket binding was successful" << std::endl;
+
+	// wait for the threads to complete
+	listener.join();
+	for (auto& t : workers) {
+		if (t.joinable()) t.join();
 	}
 
-	// currently using backlog as 1 for simplicity.
-	if (listen(serverSocket, 1) == SOCKET_ERROR) {
-		std::cout << "Error on socket: " << WSAGetLastError() << std::endl;
-	}
-	else {
-		std::cout << "Success: socket listening for connections." << std::endl;
-	}
-
-	// this is a blocking function
-	acceptSocket = accept(serverSocket, NULL, NULL);
-	if (acceptSocket == INVALID_SOCKET) {
-		std::cout << "accept() failed: " << WSAGetLastError() << std::endl;
-		WSACleanup();
-		return -1;
-	}
-	std::cout << "connection accepted" << std::endl;
-	system("pause");
+	CloseHandle(iocp);
 	WSACleanup();
-
+	std::cout << "Server stopped successfully" << std::endl;
+	return 0;
 }
