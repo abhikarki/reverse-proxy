@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <thread>
 
-#pragma comment(lib, "Ws2_32.lib");
+// #pragma comment(lib, "Ws2_32.lib");
 
 constexpr unsigned short LISTEN_PORT = 8080;
 constexpr int WORKER_THREADS = 0;	// we can use our custom number of worker threads here
@@ -169,7 +169,7 @@ int main(int argc, char *argv[])
 
 	sockaddr_in addr{};
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_addr.s_addr = INADDR_ANY; 
 	addr.sin_port = htons(LISTEN_PORT);
 
 	if (bind(listenSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
@@ -371,6 +371,16 @@ int main(int argc, char *argv[])
 	std::cout << "Shutting down...";
 
 	running.store(false);
+
+	SOCKET wake = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if(wake != INVALID_SOCKET){
+		sockaddr_in sa{};
+		sa.sin_family = AF_INET;
+		inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+		sa.sin_port = htons(LISTEN_PORT);
+		connect(wake, (sockaddr*)&sa, sizeof(sa));
+		closesocket(wake);
+	}
 
 	closesocket(listenSocket);
 
