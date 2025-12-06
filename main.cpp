@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h>       // required for AcceptEx()
 #include <iostream>
 #include <string>
 #include <vector>
@@ -21,7 +22,8 @@ constexpr int BACKLOG = 128;
 enum class OpType : uint32_t
 {
 	READ = 1,
-	WRITE = 2
+	WRITE = 2,
+	ACCEPT = 3
 };
 
 struct PER_SOCKET_CONTEXT
@@ -45,8 +47,9 @@ struct PER_IO_OPERATION_DATA
 	char *buffer;
 	OpType opType;
 	DWORD flags;
+	SOCKET acceptSocket;      // for opType == Accept
 	// Constructor
-	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0)
+	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0), acceptSocket(INVALID_SOCKET)
 	{
 		// set all members of overlapped to zero
 		ZeroMemory(&overlapped, sizeof(overlapped));
@@ -60,6 +63,11 @@ struct PER_IO_OPERATION_DATA
 		{
 			delete[] buffer;
 			buffer = nullptr;
+		}
+
+		if(acceptSocket != INVALID_SOCKET){
+			closesocket(acceptSocket);
+			acceptSocket = INVALID_SOCKET;
 		}
 	}
 };
@@ -128,6 +136,48 @@ PER_IO_OPERATION_DATA *post_send(PER_SOCKET_CONTEXT *sockCtx, const char *data, 
 		}
 	}
 	return ioData;
+}
+
+PER_IO_OPERATION_DATA* post_accept(HANDLE iocp){
+	
+}
+
+// pointer to the extension function AcceptEx(), PASCAL calling convention (callee stack cleanup, left-to-right push)
+typedef BOOL (PASCAL *LPFN_ACCEPTEX)(
+	SOCKET sListenSocket,
+	SOCKET sAcceptSocket,
+	PVOID lpOutputBuffer,
+	DWORD dwReceiveDataLength,
+	DWORD dwLocalAddressLength,
+	DWORD dwRemoteAddressLength,
+	LPDWORD lpdwBytesReceived,
+	LPOVERLAPPED lpOverlapped);
+
+LPFN_ACCEPTEX g_AcceptEx = nullptr;
+SOCKET g_listenSocket = INVALID_SOCKET;
+
+
+// when successful g_AcceptEx contains the pointer to the AcceptEx() function
+bool init_acceptex(SOCKET listenSock){
+	g_listenSocket = listenSock;
+	GUID guidAcceptEx = WSAID_ACCEPTEX;   // Globally Unique Identifier for AcceptEx()
+	DWORD bytes = 0;
+	int rc = WSAIoctl(
+		listenSock,
+		SIO_GET_EXTENSION_FUNCTION_POINTER,   // control code to specify the task
+		&guidAcceptEx,
+		sizeof(guidAcceptEx),
+		&g_AcceptEx,
+		sizeof(g_AcceptEx),
+		&bytes,
+		nullptr,
+		nullptr);
+
+	if(rc == SOCKET_ERROR){
+		print_wsa_error("WSAIoctl failed, failed to get the function pointer");
+		return false;
+	}
+	return true;
 }
 
 int main(int argc, char *argv[])
