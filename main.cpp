@@ -18,6 +18,9 @@ constexpr unsigned short LISTEN_PORT = 8080;
 constexpr int WORKER_THREADS = 0;	// we can use our custom number of worker threads here
 constexpr int BUF_SIZE = 16 * 1024; // 16 KB
 constexpr int BACKLOG = 128;
+// number of bytes for addresses (IPV4). AcceptEx documentation says buffer size parameters must be at least 16 bytes greater than
+// size of address structure for the transport protocol in use
+constexpr int ACCEPT_ADDR_LEN = sizeof(sockaddr_in) + 16;
 
 enum class OpType : uint32_t
 {
@@ -30,8 +33,9 @@ struct PER_SOCKET_CONTEXT
 {
 	SOCKET socket;
 	std::atomic<bool> closing;
+	std::atomic<int> pendingIO;
 	// Constructor, allow uninitialized socket and set closing to false (client connection active)
-	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false) {}
+	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0) {}
 };
 
 void print_wsa_error(const char *msg)
@@ -72,6 +76,22 @@ struct PER_IO_OPERATION_DATA
 	}
 };
 
+
+// pointer to the extension function AcceptEx(), PASCAL calling convention (callee stack cleanup, left-to-right push)
+typedef BOOL (PASCAL *LPFN_ACCEPTEX)(
+	SOCKET sListenSocket,
+	SOCKET sAcceptSocket,
+	PVOID lpOutputBuffer,
+	DWORD dwReceiveDataLength,
+	DWORD dwLocalAddressLength,
+	DWORD dwRemoteAddressLength,
+	LPDWORD lpdwBytesReceived,
+	LPOVERLAPPED lpOverlapped);
+
+LPFN_ACCEPTEX g_AcceptEx = nullptr;
+SOCKET g_listenSocket = INVALID_SOCKET;
+
+
 PER_IO_OPERATION_DATA *post_recv(PER_SOCKET_CONTEXT *sockCtx)
 {
 	auto *ioData = new PER_IO_OPERATION_DATA(OpType::READ);
@@ -80,6 +100,8 @@ PER_IO_OPERATION_DATA *post_recv(PER_SOCKET_CONTEXT *sockCtx)
 	ioData->wsaBuf.len = BUF_SIZE;
 	ioData->flags = 0;
 	ZeroMemory(&ioData->overlapped, sizeof(ioData->overlapped));
+
+	sockCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
 
 	DWORD bytesReceived = 0;
 	int rc = WSARecv(
@@ -96,6 +118,7 @@ PER_IO_OPERATION_DATA *post_recv(PER_SOCKET_CONTEXT *sockCtx)
 		int err = WSAGetLastError();
 		if (err != WSA_IO_PENDING)
 		{
+			sockCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
 			print_wsa_error("WSARecv failed");
 			delete ioData;
 			return nullptr;
@@ -114,6 +137,8 @@ PER_IO_OPERATION_DATA *post_send(PER_SOCKET_CONTEXT *sockCtx, const char *data, 
 	ioData->wsaBuf.len = len;
 	ZeroMemory(&ioData->overlapped, sizeof(ioData->overlapped));
 
+	sockCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
 	DWORD bytesSent = 0;
 	int rc = WSASend(
 		sockCtx->socket,
@@ -130,6 +155,8 @@ PER_IO_OPERATION_DATA *post_send(PER_SOCKET_CONTEXT *sockCtx, const char *data, 
 		int err = WSAGetLastError();
 		if (err != WSA_IO_PENDING)
 		{
+			// failed immediately so we undo the increment as well
+			sockCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
 			print_wsa_error("WSASend failed");
 			delete ioData;
 			return nullptr;
@@ -138,23 +165,52 @@ PER_IO_OPERATION_DATA *post_send(PER_SOCKET_CONTEXT *sockCtx, const char *data, 
 	return ioData;
 }
 
+
+// 
 PER_IO_OPERATION_DATA* post_accept(HANDLE iocp){
-	
+	// the pointer to the AcceptEx function needs to be initialized
+	if(!g_AcceptEx) return nullptr;
+
+	auto *ioData = new PER_IO_OPERATION_DATA(OpType::ACCEPT);
+
+	ioData->buffer = new char[(ACCEPT_ADDR_LEN) * 2];
+	ioData->wsaBuf.buf = ioData->buffer;
+	ioData->wsaBuf.len = (ACCEPT_ADDR_LEN) * 2;
+
+	SOCKET acceptSock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+	if(acceptSock == INVALID_SOCKET){
+		print_wsa_error("WSASocket for accept failed");
+		delete ioData;
+		return nullptr;
+	}
+	ioData->acceptSocket = acceptSock;
+
+	DWORD bytesReceived = 0;
+	BOOL ok = g_AcceptEx(
+		g_listenSocket,
+		acceptSock,
+		ioData->buffer,
+		0,
+		ACCEPT_ADDR_LEN,
+		ACCEPT_ADDR_LEN,
+		&bytesReceived,
+		&ioData->overlapped
+	);
+
+	if(!ok){
+		int err = WSAGetLastError();
+		if(err != ERROR_IO_PENDING && err != WSA_IO_PENDING){
+			// this means that immediate failure occurred.
+			print_wsa_error("AcceptEx failed");
+			closesocket(acceptSock);
+			delete ioData;
+			return nullptr;
+		}
+	}
+	// so we posted AcceptEx and the completion will be notified by the IOCP 
+	// acceptSock will be associated with the iocp handle later when we receive a client connection.
+	return ioData;
 }
-
-// pointer to the extension function AcceptEx(), PASCAL calling convention (callee stack cleanup, left-to-right push)
-typedef BOOL (PASCAL *LPFN_ACCEPTEX)(
-	SOCKET sListenSocket,
-	SOCKET sAcceptSocket,
-	PVOID lpOutputBuffer,
-	DWORD dwReceiveDataLength,
-	DWORD dwLocalAddressLength,
-	DWORD dwRemoteAddressLength,
-	LPDWORD lpdwBytesReceived,
-	LPOVERLAPPED lpOverlapped);
-
-LPFN_ACCEPTEX g_AcceptEx = nullptr;
-SOCKET g_listenSocket = INVALID_SOCKET;
 
 
 // when successful g_AcceptEx contains the pointer to the AcceptEx() function
@@ -178,6 +234,15 @@ bool init_acceptex(SOCKET listenSock){
 		return false;
 	}
 	return true;
+}
+
+void safeClose(PER_SOCKET_CONTEXT* ctx){
+	if(ctx->socket != INVALID_SOCKET){
+		shutdown(ctx->socket, SD_BOTH);
+		closesocket(ctx->socket);
+		ctx->socket = INVALID_SOCKET;
+	}
+	delete ctx;
 }
 
 int main(int argc, char *argv[])
@@ -251,6 +316,15 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	// associating listen socket with iocp since it will post completion related to the accepted connections
+	CreateIoCompletionPort((HANDLE)listenSocket, iocp, 0, 0);
+
+	if(!init_acceptex(listenSocket)){
+		closesocket(listenSocket);
+		WSACleanup();
+		return 1;
+	}
+
 	// creating worker thread pool
 	unsigned int cpuCount = std::max(1u, static_cast<unsigned int>(std::thread::hardware_concurrency()));
 	unsigned int numWorkers = (WORKER_THREADS > 0) ? WORKER_THREADS : (cpuCount * 2);
@@ -259,6 +333,14 @@ int main(int argc, char *argv[])
 	workers.reserve(numWorkers);
 
 	std::cout << "Starting " << numWorkers << " worker threads" << std::endl;
+
+	int initial_accepts = std::max(4, (int)numWorkers);
+	std::vector<PER_IO_OPERATION_DATA*> pendingAccepts;
+	pendingAccepts.reserve(initial_accepts);
+	for(int i = 0; i < initial_accepts; i++){
+		PER_IO_OPERATION_DATA* acceptData = post_accept(iocp);
+		if(acceptData) pendingAccepts.push_back(acceptData);
+	}
 
 	for (unsigned int i = 0; i < numWorkers; i++)
 	{
@@ -284,6 +366,9 @@ int main(int argc, char *argv[])
 				// the overlapped is the first member, so we can take it as the start of the PER_IO_OPERATION_DATA
 				PER_IO_OPERATION_DATA* ioData = reinterpret_cast<PER_IO_OPERATION_DATA*>(overlapped);
 
+				if(!ioData){
+					continue;
+				}
 				// checking the result for the GetQueuedCompletionStatus
 				if (!ok) {
 					DWORD err = GetLastError();
@@ -297,6 +382,12 @@ int main(int argc, char *argv[])
 						continue;
 					}
 					else {
+						if(ioData->opType == OpType::READ || ioData->opType == OpType::WRITE){
+							if(sockCtx){
+								int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+								if(remain == 0 && sockCtx->closing.load()) safeClose(sockCtx);
+							}
+						}
 						// I/O operation failed, if cleanup thread deleted sockCtx, we will delete socket's pending operations' context
 						if (ioData != nullptr) {
 							delete ioData;
@@ -316,6 +407,59 @@ int main(int argc, char *argv[])
 				// final check before proceeding
 				assert(sockCtx != nullptr && ioData != nullptr);
 
+				if(ioData->opType == OpType::ACCEPT){
+					SOCKET accepted = ioData->acceptSocket;
+					DWORD dwErr = 0;
+
+					if(accepted != INVALID_SOCKET){
+						int rc = setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char*)&g_listenSocket, sizeof(g_listenSocket));
+						if(rc == SOCKET_ERROR){
+							print_wsa_error("SO_UPDATE_ACCEPT_CONTEXT_FAILED");
+							closesocket(accepted);
+							delete ioData;
+
+							PER_IO_OPERATION_DATA* next = post_accept(iocp);
+							if(next){
+								// Since we donot have a mutex to protect pendingAccepts vector, we cannot push_back this pending accept
+								// to the vector since this can create a race condition. so, we will skip this for now and let kernel handle
+								// the cleanup of pending accepts when shutting down.
+							}
+							continue;
+						}
+
+						PER_SOCKET_CONTEXT* sockCtx = new PER_SOCKET_CONTEXT(accepted);
+						if(!CreateIoCompletionPort((HANDLE)accepted, iocp, (ULONG_PTR)sockCtx, 0)){
+							print_wsa_error("associating the accept socket with iocp failed");
+							closesocket(accepted);
+							delete sockCtx;
+							delete ioData;
+							PER_IO_OPERATION_DATA* next = post_accept(iocp);
+							if(next) {
+								// same as before, skip since no mutex on the pending accepts vector
+							}
+							continue;
+						}
+
+						// initiate first receive on the new socket
+						PER_IO_OPERATION_DATA* recvOp = post_recv(sockCtx);
+						if(!recvOp){
+							std::cerr << "Failed to post initial receive for the accepted socket" << std::endl;
+							if(!sockCtx->closing.exchange(true)){
+								closesocket(sockCtx->socket);
+								delete sockCtx;
+							}
+						}
+					}
+
+					delete ioData;
+					// post another accept
+					PER_IO_OPERATION_DATA* nextAccept = post_accept(iocp);
+					if(nextAccept){
+						// we can track by pushing it to the pending vector if it is mutex
+					}
+					continue;
+				}
+
 
 				// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
 				// Here, we close the socket operations, deallocate memory
@@ -323,8 +467,7 @@ int main(int argc, char *argv[])
 					std::cout << "client disconnected" << std::endl;
 					// signal closing. .exhchange changes the atomic variable and returns prev value
 					if (!sockCtx->closing.exchange(true)) {
-						closesocket(sockCtx->socket);
-						delete sockCtx;
+						CancelIoEx((HANDLE)sockCtx->socket, NULL);
 					}
 					delete ioData;
 					continue;
@@ -335,20 +478,27 @@ int main(int argc, char *argv[])
 
 					// non blocking, see the implementation as top.
 					post_send(sockCtx, ioData->buffer, bytesTransferred);
-
+					
+					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;  //fetch sub return previous value
+					if(remain == 0 && sockCtx->closing.load()){
+						safeClose(sockCtx);
+					}
 					// another receive, this is non blocking
 					PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
 					if (!nextRecv) {
 						std::cerr << "Failed to post receive, closing client." << std::endl;
-						if (!sockCtx->closing.exchange(true)) {
-							closesocket(sockCtx->socket);
-							delete sockCtx;
+						if(!sockCtx->closing.exchange(true)){
+							CancelIoEx((HANDLE)sockCtx->socket, NULL);
 						}
 					}
 					delete ioData;
 				}
 				else if (ioData->opType == OpType::WRITE) {
 					std::cout << "Write complete: " << bytesTransferred << std::endl;
+					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+					if(remain == 0 && sockCtx -> closing.load()){
+						safeClose(sockCtx);
+					}
 					delete ioData;
 				}
 				else {
@@ -359,80 +509,15 @@ int main(int argc, char *argv[])
 			} });
 	}
 
-	// creating a listeining thread
-	std::thread listener([listenSocket, iocp, &running]()
-						 {
-							 while (running.load())
-							 {
-								 sockaddr_in clientAddr{};
-								 int addrLen = sizeof(clientAddr);
-								 // blocking
-								 SOCKET clientSock = accept(listenSocket, (sockaddr *)&clientAddr, &addrLen);
-								 if (clientSock == INVALID_SOCKET)
-								 {
-									 int err = WSAGetLastError();
-									 if (err == WSAEINTR)
-									 {
-										 continue; // interrupt
-									 }
-									 print_wsa_error("accept failed");
-									 continue;
-								 }
-
-								 // to hold client's IP and port. NI_MAXHOST, NI_MAXSERV- system defined constants for size
-								 char host[NI_MAXHOST], serv[NI_MAXSERV];
-
-								 // get client info. flags to prevent the resolving into name
-								 if (getnameinfo((sockaddr *)&clientAddr, addrLen, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV) == 0)
-								 {
-									 std::cout << "Accepted connection from " << host << ":" << serv << std::endl;
-								 }
-								 else
-								 {
-									 std::cout << "Accepted connection, failed to get info" << std::endl;
-								 }
-
-								 // disabling the Nagle delay
-								 BOOL noDelay = TRUE;
-								 setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, (const char *)&noDelay, sizeof(noDelay));
-								 // initializing socket context
-								 PER_SOCKET_CONTEXT *sockCtx = new PER_SOCKET_CONTEXT(clientSock);
-
-								 if (!CreateIoCompletionPort((HANDLE)clientSock, iocp, (ULONG_PTR)sockCtx, 0))
-								 {
-									 print_wsa_error("CreateIoCompletionPort associating the client failed");
-									 closesocket(clientSock);
-									 delete sockCtx;
-									 continue;
-								 }
-
-								 PER_IO_OPERATION_DATA *recvOp = post_recv(sockCtx);
-								 if (!recvOp)
-								 {
-									 std::cerr << "Failed to post initial receive, closing client" << std::endl;
-									 closesocket(clientSock);
-									 delete sockCtx;
-									 continue;
-								 }
-							 } });
-
 	std::cout << "Press any key to stop server: ";
 	std::cin.get();
 	std::cout << "Shutting down...";
 
 	running.store(false);
 
-	SOCKET wake = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if(wake != INVALID_SOCKET){
-		sockaddr_in sa{};
-		sa.sin_family = AF_INET;
-		inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
-		sa.sin_port = htons(LISTEN_PORT);
-		connect(wake, (sockaddr*)&sa, sizeof(sa));
-		closesocket(wake);
-	}
-
 	closesocket(listenSocket);
+
+	// closing 
 
 	// post completion to wakeup worker threads.
 	for (size_t i = 0; i < workers.size(); i++)
@@ -441,11 +526,17 @@ int main(int argc, char *argv[])
 	}
 
 	// wait for the threads to complete
-	listener.join();
 	for (auto &t : workers)
 	{
 		if (t.joinable())
 			t.join();
+	}
+
+	// pendingAccepts cleanup
+	for(PER_IO_OPERATION_DATA* ioData : pendingAccepts){
+		if(ioData != nullptr){
+			delete ioData;
+		}
 	}
 
 	CloseHandle(iocp);
