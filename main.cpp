@@ -2,7 +2,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <mswsock.h>       // required for AcceptEx()
+#include <mswsock.h> // required for AcceptEx()
 #include <iostream>
 #include <string>
 #include <vector>
@@ -51,7 +51,7 @@ struct PER_IO_OPERATION_DATA
 	char *buffer;
 	OpType opType;
 	DWORD flags;
-	SOCKET acceptSocket;      // for opType == Accept
+	SOCKET acceptSocket; // for opType == Accept
 	// Constructor
 	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0), acceptSocket(INVALID_SOCKET)
 	{
@@ -69,16 +69,16 @@ struct PER_IO_OPERATION_DATA
 			buffer = nullptr;
 		}
 
-		if(acceptSocket != INVALID_SOCKET){
+		if (acceptSocket != INVALID_SOCKET)
+		{
 			closesocket(acceptSocket);
 			acceptSocket = INVALID_SOCKET;
 		}
 	}
 };
 
-
 // pointer to the extension function AcceptEx(), PASCAL calling convention (callee stack cleanup, left-to-right push)
-typedef BOOL (PASCAL *LPFN_ACCEPTEX)(
+typedef BOOL(PASCAL *LPFN_ACCEPTEX)(
 	SOCKET sListenSocket,
 	SOCKET sAcceptSocket,
 	PVOID lpOutputBuffer,
@@ -90,7 +90,6 @@ typedef BOOL (PASCAL *LPFN_ACCEPTEX)(
 
 LPFN_ACCEPTEX g_AcceptEx = nullptr;
 SOCKET g_listenSocket = INVALID_SOCKET;
-
 
 PER_IO_OPERATION_DATA *post_recv(PER_SOCKET_CONTEXT *sockCtx)
 {
@@ -165,11 +164,12 @@ PER_IO_OPERATION_DATA *post_send(PER_SOCKET_CONTEXT *sockCtx, const char *data, 
 	return ioData;
 }
 
-
-// 
-PER_IO_OPERATION_DATA* post_accept(HANDLE iocp){
+//
+PER_IO_OPERATION_DATA *post_accept(HANDLE iocp)
+{
 	// the pointer to the AcceptEx function needs to be initialized
-	if(!g_AcceptEx) return nullptr;
+	if (!g_AcceptEx)
+		return nullptr;
 
 	auto *ioData = new PER_IO_OPERATION_DATA(OpType::ACCEPT);
 
@@ -178,7 +178,8 @@ PER_IO_OPERATION_DATA* post_accept(HANDLE iocp){
 	ioData->wsaBuf.len = (ACCEPT_ADDR_LEN) * 2;
 
 	SOCKET acceptSock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
-	if(acceptSock == INVALID_SOCKET){
+	if (acceptSock == INVALID_SOCKET)
+	{
 		print_wsa_error("WSASocket for accept failed");
 		delete ioData;
 		return nullptr;
@@ -194,12 +195,13 @@ PER_IO_OPERATION_DATA* post_accept(HANDLE iocp){
 		ACCEPT_ADDR_LEN,
 		ACCEPT_ADDR_LEN,
 		&bytesReceived,
-		&ioData->overlapped
-	);
+		&ioData->overlapped);
 
-	if(!ok){
+	if (!ok)
+	{
 		int err = WSAGetLastError();
-		if(err != ERROR_IO_PENDING && err != WSA_IO_PENDING){
+		if (err != ERROR_IO_PENDING && err != WSA_IO_PENDING)
+		{
 			// this means that immediate failure occurred.
 			print_wsa_error("AcceptEx failed");
 			closesocket(acceptSock);
@@ -207,20 +209,20 @@ PER_IO_OPERATION_DATA* post_accept(HANDLE iocp){
 			return nullptr;
 		}
 	}
-	// so we posted AcceptEx and the completion will be notified by the IOCP 
+	// so we posted AcceptEx and the completion will be notified by the IOCP
 	// acceptSock will be associated with the iocp handle later when we receive a client connection.
 	return ioData;
 }
 
-
 // when successful g_AcceptEx contains the pointer to the AcceptEx() function
-bool init_acceptex(SOCKET listenSock){
+bool init_acceptex(SOCKET listenSock)
+{
 	g_listenSocket = listenSock;
-	GUID guidAcceptEx = WSAID_ACCEPTEX;   // Globally Unique Identifier for AcceptEx()
+	GUID guidAcceptEx = WSAID_ACCEPTEX; // Globally Unique Identifier for AcceptEx()
 	DWORD bytes = 0;
 	int rc = WSAIoctl(
 		listenSock,
-		SIO_GET_EXTENSION_FUNCTION_POINTER,   // control code to specify the task
+		SIO_GET_EXTENSION_FUNCTION_POINTER, // control code to specify the task
 		&guidAcceptEx,
 		sizeof(guidAcceptEx),
 		&g_AcceptEx,
@@ -229,15 +231,18 @@ bool init_acceptex(SOCKET listenSock){
 		nullptr,
 		nullptr);
 
-	if(rc == SOCKET_ERROR){
+	if (rc == SOCKET_ERROR)
+	{
 		print_wsa_error("WSAIoctl failed, failed to get the function pointer");
 		return false;
 	}
 	return true;
 }
 
-void safeClose(PER_SOCKET_CONTEXT* ctx){
-	if(ctx->socket != INVALID_SOCKET){
+void safeClose(PER_SOCKET_CONTEXT *ctx)
+{
+	if (ctx->socket != INVALID_SOCKET)
+	{
 		shutdown(ctx->socket, SD_BOTH);
 		closesocket(ctx->socket);
 		ctx->socket = INVALID_SOCKET;
@@ -263,7 +268,7 @@ int main(int argc, char *argv[])
 	}
 
 	// Initializing a listening socket.
-	SOCKET listenSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, 0);
+	SOCKET listenSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
 	if (listenSocket == INVALID_SOCKET)
 	{
 		std::cout << "Error creating listening socket" << WSAGetLastError() << std::endl;
@@ -284,7 +289,7 @@ int main(int argc, char *argv[])
 
 	sockaddr_in addr{};
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY; 
+	addr.sin_addr.s_addr = INADDR_ANY;
 	addr.sin_port = htons(LISTEN_PORT);
 
 	if (bind(listenSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
@@ -319,7 +324,8 @@ int main(int argc, char *argv[])
 	// associating listen socket with iocp since it will post completion related to the accepted connections
 	CreateIoCompletionPort((HANDLE)listenSocket, iocp, 0, 0);
 
-	if(!init_acceptex(listenSocket)){
+	if (!init_acceptex(listenSocket))
+	{
 		closesocket(listenSocket);
 		WSACleanup();
 		return 1;
@@ -333,14 +339,7 @@ int main(int argc, char *argv[])
 	workers.reserve(numWorkers);
 
 	std::cout << "Starting " << numWorkers << " worker threads" << std::endl;
-
-	int initial_accepts = std::max(4, (int)numWorkers);
-	std::vector<PER_IO_OPERATION_DATA*> pendingAccepts;
-	pendingAccepts.reserve(initial_accepts);
-	for(int i = 0; i < initial_accepts; i++){
-		PER_IO_OPERATION_DATA* acceptData = post_accept(iocp);
-		if(acceptData) pendingAccepts.push_back(acceptData);
-	}
+	std::cout.flush();
 
 	for (unsigned int i = 0; i < numWorkers; i++)
 	{
@@ -404,9 +403,6 @@ int main(int argc, char *argv[])
 					continue;
 				}
 
-				// final check before proceeding
-				assert(sockCtx != nullptr && ioData != nullptr);
-
 				if(ioData->opType == OpType::ACCEPT){
 					SOCKET accepted = ioData->acceptSocket;
 					DWORD dwErr = 0;
@@ -449,6 +445,9 @@ int main(int argc, char *argv[])
 								delete sockCtx;
 							}
 						}
+						
+						// Prevent the destructor from closing the socket we just handed off
+						ioData->acceptSocket = INVALID_SOCKET;
 					}
 
 					delete ioData;
@@ -509,6 +508,17 @@ int main(int argc, char *argv[])
 			} });
 	}
 
+	// Post initial accepts AFTER worker threads are created
+	int initial_accepts = std::max(4, (int)numWorkers);
+	std::vector<PER_IO_OPERATION_DATA *> pendingAccepts;
+	pendingAccepts.reserve(initial_accepts);
+	for (int i = 0; i < initial_accepts; i++)
+	{
+		PER_IO_OPERATION_DATA *acceptData = post_accept(iocp);
+		if (acceptData)
+			pendingAccepts.push_back(acceptData);
+	}
+
 	std::cout << "Press any key to stop server: ";
 	std::cin.get();
 	std::cout << "Shutting down...";
@@ -517,7 +527,7 @@ int main(int argc, char *argv[])
 
 	closesocket(listenSocket);
 
-	// closing 
+	// closing
 
 	// post completion to wakeup worker threads.
 	for (size_t i = 0; i < workers.size(); i++)
@@ -533,8 +543,10 @@ int main(int argc, char *argv[])
 	}
 
 	// pendingAccepts cleanup
-	for(PER_IO_OPERATION_DATA* ioData : pendingAccepts){
-		if(ioData != nullptr){
+	for (PER_IO_OPERATION_DATA *ioData : pendingAccepts)
+	{
+		if (ioData != nullptr)
+		{
 			delete ioData;
 		}
 	}
