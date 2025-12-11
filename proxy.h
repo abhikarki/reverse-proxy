@@ -36,6 +36,8 @@ namespace RateLimit{
         Config config;
         std::unordered_map<std::string, TokenBucket> buckets;
         mutable std::shared_mutex mutex;     // to provide Reader Writer lock
+
+        void refillBucket(TokenBucket& bucket);
     
     public:
         // constructor with our default config
