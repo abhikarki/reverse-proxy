@@ -11,6 +11,7 @@
 #include <cassert>
 #include <algorithm>
 #include <thread>
+#include "proxy.h"
 
 // #pragma comment(lib, "Ws2_32.lib");
 
@@ -21,6 +22,8 @@ constexpr int BACKLOG = 128;
 // number of bytes for addresses (IPV4). AcceptEx documentation says buffer size parameters must be at least 16 bytes greater than
 // size of address structure for the transport protocol in use
 constexpr int ACCEPT_ADDR_LEN = sizeof(sockaddr_in) + 16;
+// initialize rate limiter
+RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true));
 
 enum class OpType : uint32_t
 {
@@ -34,6 +37,7 @@ struct PER_SOCKET_CONTEXT
 	SOCKET socket;
 	std::atomic<bool> closing;
 	std::atomic<int> pendingIO;
+	std::string clientIP;     // for rate limiting
 	// Constructor, allow uninitialized socket and set closing to false (client connection active)
 	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0) {}
 };
@@ -423,7 +427,33 @@ int main(int argc, char *argv[])
 							continue;
 						}
 
+						std::string clientIP = ProxyUtil::getClientIPFromAcceptEx(
+							g_listenSocket,
+							ioData->buffer,
+							ACCEPT_ADDR_LEN,
+							ACCEPT_ADDR_LEN
+						);
+
+						// check the rate limit status for the client
+						if(!g_rateLimiter.allowRequest(clientIP)){
+							// get the 429 HTTP response
+							std::string response = RateLimit::build429Response(
+								g_rateLimiter.getRetryAfter(clientIP),
+								g_rateLimiter.getConfig().maxTokens,
+								g_rateLimiter.getRemainingTokens(clientIP)
+							);
+
+							// blocking!
+							send(accepted, response.c_str(), (int)response.size(), 0);
+							closesocket(accepted);
+							delete ioData;
+
+							post_accept(iocp);
+							continue;
+						}
+
 						PER_SOCKET_CONTEXT* sockCtx = new PER_SOCKET_CONTEXT(accepted);
+						sockCtx->clientIP = clientIP;
 						if(!CreateIoCompletionPort((HANDLE)accepted, iocp, (ULONG_PTR)sockCtx, 0)){
 							print_wsa_error("associating the accept socket with iocp failed");
 							closesocket(accepted);
@@ -474,6 +504,33 @@ int main(int argc, char *argv[])
 
 				if (ioData->opType == OpType::READ) {
 					std::cout << "Read " << bytesTransferred << " bytes from client" << std::endl;
+
+					// rate limiting check
+					if(!g_rateLimiter.allowRequest(sockCtx->clientIP)){
+
+						std::string response = RateLimit::build429Response(
+							g_rateLimiter.getRetryAfter(sockCtx->clientIP),
+							g_rateLimiter.getConfig().maxTokens,
+							g_rateLimiter.getRemainingTokens(sockCtx->clientIP)
+						);
+						
+						post_send(sockCtx, response.c_str(), (DWORD)response.size());
+
+						// pending I/O decrement
+						int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+						if (remain == 0 && sockCtx->closing.load()){
+							safeClose(sockCtx);
+						}
+
+						PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
+						if(!nextRecv){
+							if(!sockCtx->closing.exchange(true)){
+								CancelIoEx((HANDLE)sockCtx->socket, NULL);
+							}
+						}
+						delete ioData;
+						continue;
+					}
 
 					// non blocking, see the implementation as top.
 					post_send(sockCtx, ioData->buffer, bytesTransferred);
