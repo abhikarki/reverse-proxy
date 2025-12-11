@@ -32,14 +32,62 @@ int main(int argc, char *argv[]) {
 	}
 
 	std::cout << "Connected to Server" << std::endl;
+	std::cout << "Commands: 'ratelimit_test' to test rate limiting, 'exit' to quit\n" << std::endl;
+
 	
 	char recvBuf[4096];
 	while(true){
 		std::string msg;
-		std::cout << ">";
+		std::cout << "Enter message: ";
 		std::getline(std::cin, msg);
 
 		if(msg == "exit") break;
+
+		if(msg == "ratelimit_test"){
+			std::cout << "\n ==Rate Limit Test--" << std::endl;
+			std::cout << "Sending 120 rapid requests to trigger rate limiting" << std::endl;
+
+			int allowed = 0;
+			int blocked = 0;
+			for(int i = 1; i <= 120; i++){
+				std::string testMsg = "Request " + std::to_string(i) + "\n";
+				int sent = send(clientSocket, testMsg.c_str(), (int)testMsg.size(), 0);
+				if(sent == SOCKET_ERROR){
+					std::cerr << "send failed at request" << i << std::endl;
+					break;
+				}
+
+				int recvLen = recv(clientSocket, recvBuf, sizeof(recvBuf) - 1, 0);
+				if(recvLen <= 0){
+					std::cerr << "Server closed connection at request" << i << std::endl;
+					break;
+				}
+				recvBuf[recvLen] = '\0';
+
+				std::string response(recvBuf);
+				if(response.find("429") != std::string::npos){
+					blocked++;
+					if(blocked == 1){
+						std::cout << "First 429 at request " << i << std::endl;
+					}
+					else{
+						allowed++;
+					}
+
+					//  progress 
+				if(i % 20 == 0){
+					std::cout << "Progress: " << i << "/120 (Allowed: " << allowed << ", Blocked: " << blocked << ")" << std::endl;
+				}
+				}
+				
+				std::cout << "\n=== Results ===" << std::endl;
+				std::cout << "Total Allowed: " << allowed << std::endl;
+				std::cout << "Total Blocked (429): " << blocked << std::endl;
+				std::cout << "================\n" << std::endl;
+				continue;
+				
+			}
+		}
 		msg.push_back('\n');
 		int sent = send(clientSocket, msg.c_str(), (int)msg.size(), 0);
 		if(sent == SOCKET_ERROR){
