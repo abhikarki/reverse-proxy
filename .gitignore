@@ -5,3 +5,8 @@
 *.obj
 *.log
 /.vscode/
+.env
+server.key
+server.crt
+*.pem
+README.md
