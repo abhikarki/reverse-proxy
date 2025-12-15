@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <thread>
 #include "proxy.h"
+#include "tls/tls_context.h"
+#include "tls/tls_connection.h"
 
 // #pragma comment(lib, "Ws2_32.lib");
 
@@ -24,6 +26,8 @@ constexpr int BACKLOG = 128;
 constexpr int ACCEPT_ADDR_LEN = sizeof(sockaddr_in) + 16;
 // initialize rate limiter
 RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true));
+// TLS context
+TLS::Context g_tlsContext;
 
 enum class OpType : uint32_t
 {
@@ -37,10 +41,31 @@ struct PER_SOCKET_CONTEXT
 	SOCKET socket;
 	std::atomic<bool> closing;
 	std::atomic<int> pendingIO;
-	std::string clientIP;     // for rate limiting
+	std::string clientIP; // for rate limiting
+
+	std::unique_ptr<TLS::Connection> tlsConn;
+	bool tlsEnabled;
+
+	std::vector<char> tlsInputBuffer;
+	std::vector<char> tlsOutputBuffer;
+	std::vector<char> appDataBuffer;
+
 	// Constructor, allow uninitialized socket and set closing to false (client connection active)
-	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0) {}
+	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0), tlsEnabled(false) {}
+
+	// create the Connection object
+	void enableTLS(SSL_CTX *ctx)
+	{
+		tlsConn = std::make_unique<TLS::Connection>(ctx, true);
+		tlsEnabled = true;
+	}
 };
+
+// Forward declarations for TLS functions
+void sendTLSPendingData(PER_SOCKET_CONTEXT *sockCtx);
+void sendTLSData(PER_SOCKET_CONTEXT *sockCtx, const char *plainData, size_t len);
+void handleTLSRead(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD bytesReceived);
+void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len);
 
 void print_wsa_error(const char *msg)
 {
@@ -247,11 +272,228 @@ void safeClose(PER_SOCKET_CONTEXT *ctx)
 {
 	if (ctx->socket != INVALID_SOCKET)
 	{
+		if (ctx->tlsEnabled && ctx->tlsConn)
+		{
+			ctx->tlsConn->shutdown();
+			if (ctx->tlsConn->hasNetworkDataPending())
+			{
+				char buf[BUF_SIZE];
+				size_t len = ctx->tlsConn->getNetworkData(buf, sizeof(buf));
+				if (len > 0)
+				{
+					// blocking send. fine for closing.
+					send(ctx->socket, buf, (int)len, 0);
+				}
+			}
+		}
 		shutdown(ctx->socket, SD_BOTH);
 		closesocket(ctx->socket);
 		ctx->socket = INVALID_SOCKET;
 	}
 	delete ctx;
+}
+
+void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
+{
+	std::cout << "Received " << len << " bytes of application data\n" << std::endl;
+	if (!g_rateLimiter.allowRequest(sockCtx->clientIP))
+	{
+		std::string response = RateLimit::build429Response(
+			g_rateLimiter.getRetryAfter(sockCtx->clientIP),
+			g_rateLimiter.getConfig().maxTokens,
+			g_rateLimiter.getRemainingTokens(sockCtx->clientIP));
+		sendTLSData(sockCtx, response.c_str(), response.size());
+		return;
+	}
+
+	
+	// Log decrypted data (should be readable)
+	std::cout << "=== DECRYPTED DATA (" << len << " bytes) ===" << std::endl;
+	std::cout << "Content: " << std::string(data, len) << std::endl;
+
+	sendTLSData(sockCtx, data, len);
+}
+
+// handling raw encrypted data from the network, including the first ClientHello message itself
+void handleTLSRead(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD bytesReceived)
+{
+	// Log raw encrypted data (will be garbage)
+	std::cout << "\n=== RAW NETWORK DATA (" << bytesReceived << " bytes) ===" << std::endl;
+	std::cout << "First 32 bytes (hex): ";
+	for (DWORD i = 0; i < std::min(bytesReceived, 32UL); i++)
+	{
+		printf("%02X ", (unsigned char)data[i]);
+	}
+
+	std::cout << std::endl;
+	if (!sockCtx->tlsEnabled)
+	{
+		processPlainData(sockCtx, data, bytesReceived);
+		return;
+	}
+
+	auto &tls = sockCtx->tlsConn;
+
+	// feed encrypted data to OpenSSL.
+	tls->feedNetworkData(data, bytesReceived);
+
+	// if handshake is not completed, the current read could be the ClientHello or the final client message in the handshake
+	if (tls->getState() != TLS::State::ESTABLISHED)
+	{
+		// execute the next step in the state machine.
+		TLS::IOResult result = tls->doHandshake();
+
+		// if it was a ClientHello read, OpenSSL could have some data to write back to the client
+		if (tls->hasNetworkDataPending())
+		{
+			sendTLSPendingData(sockCtx);
+		}
+
+		if (result == TLS::IOResult::SUCCESS)
+		{
+			std::cout << "TLS handshake complete: " << tls->getVersion() << " " << tls->getCipher() << "\n\n";
+			if (!tls->getSNI().empty())
+			{
+				std::cout << "SNI: " << tls->getSNI() << "\n";
+			}
+
+			// After Handshake is complete, there might be some data sent by the client along with the finished message.
+			// OpenSSL already decrypts the message
+			char plainBuffer[BUF_SIZE];
+			size_t bytesRead = 0;
+
+			TLS::IOResult readResult = tls->read(plainBuffer, sizeof(plainBuffer), bytesRead);
+			if (readResult == TLS::IOResult::SUCCESS && bytesRead > 0)
+			{
+				processPlainData(sockCtx, plainBuffer, static_cast<DWORD>(bytesRead));
+			}
+			// next post_recv is posted by the worker thread after this function returns.
+		}
+		else if (result == TLS::IOResult::WANT_READ)
+		{
+			// post_recv(sockCtx); -- recv is posted by worker thread
+		}
+		else if (result == TLS::IOResult::IO_ERROR)
+		{
+			std::cerr << "TLS handshake failed" << std::endl;
+			if (!sockCtx->closing.exchange(true))
+			{
+				CancelIoEx((HANDLE)sockCtx->socket, NULL);
+			}
+		}
+		return;
+	}
+
+	// if TLS is established, reading the data
+	char plainBuffer[BUF_SIZE];
+	size_t bytesRead = 0;
+	bool shouldClose = false;
+	bool hasError = false;
+
+	// keep reading the decrypted data.
+	while (true)
+	{
+		TLS::IOResult result = tls->read(plainBuffer, sizeof(plainBuffer), bytesRead);
+
+		if (result == TLS::IOResult::SUCCESS && bytesRead > 0)
+		{
+			processPlainData(sockCtx, plainBuffer, static_cast<DWORD>(bytesRead));
+		}
+		else if (result == TLS::IOResult::WANT_READ)
+		{
+			// post_recv(sockCtx);  -- posting recv by worker thread
+			break;
+		}
+		else if (result == TLS::IOResult::CLOSED)
+		{
+			std::cout << "TLS connection closed by peer " << std::endl;
+			shouldClose = true;
+			break;
+		}
+		else
+		{
+			std::cerr << "TLS read error " << std::endl;
+			hasError = true;
+			break;
+		}
+	}
+
+	if (shouldClose || hasError)
+	{
+		if (!sockCtx->closing.exchange(true))
+		{
+			CancelIoEx((HANDLE)sockCtx->socket, NULL);
+		}
+	}
+}
+
+// send plain data or encrypted data
+void sendTLSData(PER_SOCKET_CONTEXT *sockCtx, const char *plainData, size_t len)
+{
+	// is tls not enabled, just sending plain data.
+	if (!sockCtx->tlsEnabled)
+	{
+		post_send(sockCtx, plainData, static_cast<DWORD>(len));
+		return;
+	}
+
+	auto &tls = sockCtx->tlsConn;
+
+	if (tls->getState() != TLS::State::ESTABLISHED)
+	{
+		std::cerr << "Cannot send data : TLS not established" << std::endl;
+		return;
+	}
+	size_t totalWritten = 0;
+
+	while (totalWritten < len)
+	{
+		size_t bytesWritten = 0;
+		TLS::IOResult result = tls->write(
+			plainData + totalWritten,
+			len - totalWritten,
+			bytesWritten);
+
+		if (result == TLS::IOResult::SUCCESS)
+		{
+			totalWritten += bytesWritten;
+		}
+		else if (result == TLS::IOResult::WANT_WRITE)
+		{
+			sendTLSPendingData(sockCtx);
+		}
+		else if (result == TLS::IOResult::WANT_READ)
+		{
+			break;
+		}
+		else
+		{
+			std::cerr << "TLS write error" << std::endl;
+			break;
+		}
+	}
+
+	if (tls->hasNetworkDataPending())
+	{
+		sendTLSPendingData(sockCtx);
+	}
+}
+
+// send the OpenSSL data from the wbio
+void sendTLSPendingData(PER_SOCKET_CONTEXT *sockCtx)
+{
+	auto &tls = sockCtx->tlsConn;
+	char encryptedBuffer[BUF_SIZE];
+
+	// loop to completely send the data put in the OpenSSL buffer.
+	while (tls->hasNetworkDataPending())
+	{
+		size_t bytesToSend = tls->getNetworkData(encryptedBuffer, sizeof(encryptedBuffer));
+		if (bytesToSend > 0)
+		{
+			post_send(sockCtx, encryptedBuffer, static_cast<DWORD>(bytesToSend));
+		}
+	}
 }
 
 int main(int argc, char *argv[])
@@ -270,6 +512,17 @@ int main(int argc, char *argv[])
 		std::cout << "Winsock dll initialized" << std::endl;
 		std::cout << "Status: " << wsaData.szSystemStatus << std::endl;
 	}
+
+	// OpenSSL initialization
+	TLS::Context::initLibrary();
+
+	if (!g_tlsContext.initServer("server.crt", "server.key"))
+	{
+		std::cerr << "Failed to initialize TLS context\n";
+		return 1;
+	}
+
+	std::cout << "TLS initialized successfully\n";
 
 	// Initializing a listening socket.
 	SOCKET listenSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
@@ -443,8 +696,7 @@ int main(int argc, char *argv[])
 								g_rateLimiter.getRemainingTokens(clientIP)
 							);
 
-							// blocking!
-							send(accepted, response.c_str(), (int)response.size(), 0);
+							// blocking
 							closesocket(accepted);
 							delete ioData;
 
@@ -454,6 +706,8 @@ int main(int argc, char *argv[])
 
 						PER_SOCKET_CONTEXT* sockCtx = new PER_SOCKET_CONTEXT(accepted);
 						sockCtx->clientIP = clientIP;
+						sockCtx->enableTLS(g_tlsContext.get());
+
 						if(!CreateIoCompletionPort((HANDLE)accepted, iocp, (ULONG_PTR)sockCtx, 0)){
 							print_wsa_error("associating the accept socket with iocp failed");
 							closesocket(accepted);
@@ -493,10 +747,22 @@ int main(int argc, char *argv[])
 				// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
 				// Here, we close the socket operations, deallocate memory
 				if (bytesTransferred == 0 && ioData->opType == OpType::READ) {
-					std::cout << "client disconnected" << std::endl;
-					// signal closing. .exhchange changes the atomic variable and returns prev value
-					if (!sockCtx->closing.exchange(true)) {
+					std::cout << "Client disconnected" << std::endl;
+
+					if(sockCtx->tlsEnabled && sockCtx->tlsConn){
+						sockCtx->tlsConn->shutdown();
+						// sending close notify
+						if(sockCtx->tlsConn->hasNetworkDataPending()){
+							sendTLSPendingData(sockCtx);
+						}
+					}
+
+					if(!sockCtx->closing.exchange(true)){
 						CancelIoEx((HANDLE)sockCtx->socket, NULL);
+					}
+					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+					if(remain == 0){
+						safeClose(sockCtx);
 					}
 					delete ioData;
 					continue;
@@ -505,46 +771,22 @@ int main(int argc, char *argv[])
 				if (ioData->opType == OpType::READ) {
 					std::cout << "Read " << bytesTransferred << " bytes from client" << std::endl;
 
-					// rate limiting check
-					if(!g_rateLimiter.allowRequest(sockCtx->clientIP)){
+					// Process through TLS first (handshake or decrypt)
+					handleTLSRead(sockCtx, ioData->buffer, bytesTransferred);
 
-						std::string response = RateLimit::build429Response(
-							g_rateLimiter.getRetryAfter(sockCtx->clientIP),
-							g_rateLimiter.getConfig().maxTokens,
-							g_rateLimiter.getRemainingTokens(sockCtx->clientIP)
-						);
-						
-						post_send(sockCtx, response.c_str(), (DWORD)response.size());
-
-						// pending I/O decrement
-						int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
-						if (remain == 0 && sockCtx->closing.load()){
-							safeClose(sockCtx);
-						}
-
-						PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
-						if(!nextRecv){
-							if(!sockCtx->closing.exchange(true)){
-								CancelIoEx((HANDLE)sockCtx->socket, NULL);
-							}
-						}
-						delete ioData;
-						continue;
-					}
-
-					// non blocking, see the implementation as top.
-					post_send(sockCtx, ioData->buffer, bytesTransferred);
 					
 					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;  //fetch sub return previous value
 					if(remain == 0 && sockCtx->closing.load()){
 						safeClose(sockCtx);
 					}
-					// another receive, this is non blocking
-					PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
-					if (!nextRecv) {
-						std::cerr << "Failed to post receive, closing client." << std::endl;
-						if(!sockCtx->closing.exchange(true)){
-							CancelIoEx((HANDLE)sockCtx->socket, NULL);
+
+					if(!sockCtx->closing.load()){
+						PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
+						if (!nextRecv) {
+							std::cerr << "Failed to post receive, closing client." << std::endl;
+							if(!sockCtx->closing.exchange(true)){
+								CancelIoEx((HANDLE)sockCtx->socket, NULL);
+							}
 						}
 					}
 					delete ioData;
@@ -609,6 +851,7 @@ int main(int argc, char *argv[])
 	}
 
 	CloseHandle(iocp);
+	TLS::Context::cleanupLibrary();
 	WSACleanup();
 	std::cout << "Server stopped successfully" << std::endl;
 	return 0;

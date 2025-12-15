@@ -2,112 +2,313 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "iostream"
+#include <string>
 
-// #pragma comment(lib, "Ws2_32.lib");
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
-int main(int argc, char *argv[]) {
+class TLSClient
+{
+private:
+	SOCKET sock;
+	SSL_CTX *ctx;
+	SSL *ssl;
+	BIO *rbio; // Read BIO
+	BIO *wbio; // Write BIO
+
+public:
+	TLSClient() : sock(INVALID_SOCKET), ctx(nullptr), ssl(nullptr), rbio(nullptr), wbio(nullptr) {}
+
+	~TLSClient()
+	{
+		disconnect();
+		if (ctx)
+			SSL_CTX_free(ctx);
+	}
+
+	bool init()
+	{
+		SSL_library_init();
+		SSL_load_error_strings();
+		OpenSSL_add_all_algorithms();
+
+		ctx = SSL_CTX_new(TLS_client_method());
+		if (!ctx)
+		{
+			ERR_print_errors_fp(stderr);
+			return false;
+		}
+
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+		return true;
+	}
+
+	bool connect(const char *host, int port)
+	{
+		// creating socket
+		sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (sock == INVALID_SOCKET)
+		{
+			std::cerr << "socket() failed" << std::endl;
+			return false;
+		}
+
+		sockaddr_in server{};
+		server.sin_family = AF_INET;
+		server.sin_port = htons(port);
+		inet_pton(AF_INET, host, &server.sin_addr);
+
+		if (::connect(sock, (sockaddr *)&server, sizeof(server)) == SOCKET_ERROR)
+		{
+			std::cerr << "connect() failed: " << WSAGetLastError() << std::endl;
+			return false;
+		}
+
+		std::cout << "TCP connected to " << host << ":" << port << std::endl;
+
+		ssl = SSL_new(ctx);
+		if (!ssl)
+		{
+			ERR_print_errors_fp(stderr);
+			return false;
+		}
+
+		rbio = BIO_new(BIO_s_mem());
+		wbio = BIO_new(BIO_s_mem());
+		BIO_set_nbio(rbio, 1);
+		BIO_set_nbio(wbio, 1);
+		SSL_set_bio(ssl, rbio, wbio);
+
+		SSL_set_tlsext_host_name(ssl, host);
+		SSL_set_connect_state(ssl); // Client mode
+
+		std::cout << "Starting TLS handshake..." << std::endl;
+
+		// handshake
+		if (!doHandshake())
+		{
+			return false;
+		}
+
+		std::cout << "=== TLS Connection Established ===" << std::endl;
+		std::cout << "Version: " << SSL_get_version(ssl) << std::endl;
+		std::cout << "Cipher:  " << SSL_get_cipher_name(ssl) << std::endl;
+		std::cout << "==================================" << std::endl;
+
+		return true;
+	}
+
+	bool doHandshake()
+	{
+		char buffer[16384];
+
+		while (true)
+		{
+			int ret = SSL_do_handshake(ssl);
+
+			// send pending handshake data
+			int pending = BIO_ctrl_pending(wbio);
+			if (pending > 0)
+			{
+				int toSend = BIO_read(wbio, buffer, sizeof(buffer));
+				if (toSend > 0)
+				{
+					printHexDump("CLIENT: SENDING HANDSHAKE (ENCRYPTED)", buffer, toSend);
+					::send(sock, buffer, toSend, 0);
+				}
+			}
+
+			if (ret == 1)
+			{
+				// handshake complete
+				return true;
+			}
+
+			int err = SSL_get_error(ssl, ret);
+			if (err == SSL_ERROR_WANT_READ)
+			{
+				// receive data from server
+				int recvLen = ::recv(sock, buffer, sizeof(buffer), 0);
+				if (recvLen <= 0)
+				{
+					std::cerr << "Handshake recv failed" << std::endl;
+					return false;
+				}
+				printHexDump("CLIENT: RECEIVED HANDSHAKE (ENCRYPTED)", buffer, recvLen);
+				BIO_write(rbio, buffer, recvLen);
+			}
+			else if (err != SSL_ERROR_WANT_WRITE)
+			{
+				ERR_print_errors_fp(stderr);
+				return false;
+			}
+		}
+	}
+
+	int send(const char *plainData, int len)
+	{
+		char buffer[16384];
+
+		printHexDump("CLIENT: PLAINTEXT TO ENCRYPT", plainData, len);
+
+		int written = SSL_write(ssl, plainData, len);
+		if (written <= 0)
+			return written;
+
+		// getting encrypted data from wbio
+		int pending = BIO_ctrl_pending(wbio);
+		if (pending > 0)
+		{
+			int encryptedLen = BIO_read(wbio, buffer, sizeof(buffer));
+			printHexDump("CLIENT: ENCRYPTED BYTES TO SEND", buffer, encryptedLen);
+			return ::send(sock, buffer, encryptedLen, 0);
+		}
+		return written;
+	}
+
+	int recv(char *plainBuffer, int maxLen)
+	{
+		char buffer[16384];
+
+		// Receive encrypted data from network
+		int recvLen = ::recv(sock, buffer, sizeof(buffer), 0);
+		if(recvLen <= 0)
+			return recvLen;
+
+
+		// feeding to OpenSSL
+		BIO_write(rbio, buffer, recvLen);
+
+		// reading decrypted data
+		int decryptedLen = SSL_read(ssl, plainBuffer, maxLen);
+
+		if(decryptedLen > 0)
+		{
+			return decryptedLen;
+		}
+
+		// SSL errors
+		int err = SSL_get_error(ssl, decryptedLen);
+		if(err == SSL_ERROR_WANT_READ)
+		{
+			// trying to receive more
+			recvLen = ::recv(sock, buffer, sizeof(buffer), 0);
+			if(recvLen > 0)
+			{
+				BIO_write(rbio, buffer, recvLen);
+				decryptedLen = SSL_read(ssl, plainBuffer, maxLen);
+				if (decryptedLen > 0)
+				{
+					return decryptedLen;
+				}
+			}
+		}
+
+		// check if it is a shutdown
+		if(err == SSL_ERROR_ZERO_RETURN)
+		{
+			std::cout << "Server closed TLS connection cleanly" << std::endl;
+			return 0;
+		}
+
+		// print error
+		std::cerr << "SSL_read error: " << err << std::endl;
+		ERR_print_errors_fp(stderr);
+		return decryptedLen;
+	}
+
+	void disconnect()
+	{
+		if(ssl)
+		{
+			SSL_shutdown(ssl);
+			SSL_free(ssl);
+			ssl = nullptr;
+			rbio = nullptr;
+			wbio = nullptr;
+		}
+		if(sock != INVALID_SOCKET)
+		{
+			closesocket(sock);
+			sock = INVALID_SOCKET;
+		}
+	}
+
+private:
+	void printHexDump(const char *label, const char *data, int len)
+	{
+		std::cout << "\n========== " << label << " ==========" << std::endl;
+		std::cout << "Length: " << len << " bytes" << std::endl;
+		std::cout << "Hex: ";
+		for(int i = 0; i < std::min(len, 48); i++)
+		{
+			printf("%02X ", (unsigned char)data[i]);
+			if ((i + 1) % 16 == 0 && i + 1 < std::min(len, 48))
+				std::cout << "\n     ";
+		}
+		if(len > 48)
+			std::cout << "...";
+		std::cout << "\n================================================" << std::endl;
+	}
+};
+
+int main(int argc, char *argv[])
+{
 	WSADATA wsaData;
-	if(WSAStartup(MAKEWORD(2,2), &wsaData) != 0){
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
 		std::cerr << "WSAStartup failed" << std::endl;
 		return 1;
 	}
 
-	SOCKET clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if(clientSocket == INVALID_SOCKET){
-		std::cerr << "socket failed" << std::endl;
+	TLSClient client;
+
+	if (!client.init())
+	{
+		std::cerr << "Failed to initialize TLS" << std::endl;
 		WSACleanup();
 		return 1;
 	}
 
-	sockaddr_in server{};
-	server.sin_family = AF_INET;
-	server.sin_port = htons(8080);
-	inet_pton(AF_INET, "127.0.0.1", &server.sin_addr);
-
-	if(connect(clientSocket, (sockaddr*)&server, sizeof(server)) == SOCKET_ERROR){
-		std::cerr << "connect failed" << std::endl;
-		closesocket(clientSocket);
+	if (!client.connect("127.0.0.1", 8080))
+	{
+		std::cerr << "Failed to connect" << std::endl;
 		WSACleanup();
 		return 1;
 	}
 
-	std::cout << "Connected to Server" << std::endl;
-	std::cout << "Commands: 'ratelimit_test' to test rate limiting, 'exit' to quit\n" << std::endl;
-
-	
+	std::cout << "\nConnected! Type messages (or 'exit' to quit)\n" << std::endl;
 	char recvBuf[4096];
-	while(true){
+	while(true)
+	{
 		std::string msg;
 		std::cout << "Enter message: ";
 		std::getline(std::cin, msg);
 
-		if(msg == "exit") break;
+		if(msg == "exit")
+			break;
 
-		if(msg == "ratelimit_test"){
-			std::cout << "\n ==Rate Limit Test--" << std::endl;
-			std::cout << "Sending 120 rapid requests to trigger rate limiting" << std::endl;
-
-			int allowed = 0;
-			int blocked = 0;
-			for(int i = 1; i <= 120; i++){
-				std::string testMsg = "Request " + std::to_string(i) + "\n";
-				int sent = send(clientSocket, testMsg.c_str(), (int)testMsg.size(), 0);
-				if(sent == SOCKET_ERROR){
-					std::cerr << "send failed at request" << i << std::endl;
-					break;
-				}
-
-				int recvLen = recv(clientSocket, recvBuf, sizeof(recvBuf) - 1, 0);
-				if(recvLen <= 0){
-					std::cerr << "Server closed connection at request" << i << std::endl;
-					break;
-				}
-				recvBuf[recvLen] = '\0';
-
-				std::string response(recvBuf);
-				if(response.find("429") != std::string::npos){
-					blocked++;
-					if(blocked == 1){
-						std::cout << "First 429 at request " << i << std::endl;
-					}
-					else{
-						allowed++;
-					}
-
-					//  progress 
-				if(i % 20 == 0){
-					std::cout << "Progress: " << i << "/120 (Allowed: " << allowed << ", Blocked: " << blocked << ")" << std::endl;
-				}
-				}
-				
-				std::cout << "\n=== Results ===" << std::endl;
-				std::cout << "Total Allowed: " << allowed << std::endl;
-				std::cout << "Total Blocked (429): " << blocked << std::endl;
-				std::cout << "================\n" << std::endl;
-				continue;
-				
-			}
+		msg += "\n";
+		int sent = client.send(msg.c_str(), (int)msg.size());
+		if(sent <= 0)
+		{
+			std::cerr << "Send Failed" << std::endl;
+			break;
 		}
-		msg.push_back('\n');
-		int sent = send(clientSocket, msg.c_str(), (int)msg.size(), 0);
-		if(sent == SOCKET_ERROR){
-			std::cerr << "send failed " << WSAGetLastError() << std::endl;
+		std::cout << "\n>>> Sent successfully" << std::endl;
+
+		int recvLen = client.recv(recvBuf, sizeof(recvBuf) - 1);
+		if(recvLen <= 0)
+		{
+			std::cerr << "Recv failed or connection closed" << std::endl;
 			break;
 		}
 
-		int recvLen = recv(clientSocket, recvBuf, sizeof(recvBuf) - 1, 0);
-		if(recvLen <= 0){
-			std::cerr << "Server closed connection" << std::endl;
-			break; 
-		}
-		
-
 		recvBuf[recvLen] = '\0';
-        std::cout << "Server replies: " << recvBuf << std::endl;
+		std::cout << "\nServer replied: " << recvBuf << std::endl;
 	}
-	
-	std::cout << "closing" << std::endl;
-	closesocket(clientSocket);
+
+	client.disconnect();
 	WSACleanup();
 	return 0;
 }
