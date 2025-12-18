@@ -1,4 +1,4 @@
-# Windows Asynchronous Reverse Proxy
+## reverse-proxy
 
 An asynchronous, multi-threaded reverse proxy for Windows, designed to efficiently handle thousands of concurrent connections. Features include per-client rate limiting to mitigate application layer attacks and built-in TLS support (with session caching) for secure, high-performance communication.
 
