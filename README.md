@@ -125,7 +125,7 @@ flowchart TB
 
 
 
-3. **Starting the Proxy:**
+**Starting the Proxy:**
 
 ```bash
 make clean
