@@ -14,6 +14,9 @@
 #include "proxy.h"
 #include "tls/tls_context.h"
 #include "tls/tls_connection.h"
+#include "http_parser.h"
+#include "load_balancer.h"
+
 
 // #pragma comment(lib, "Ws2_32.lib");
 
@@ -28,6 +31,8 @@ constexpr int ACCEPT_ADDR_LEN = sizeof(sockaddr_in) + 16;
 RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true));
 // TLS context
 TLS::Context g_tlsContext;
+
+LoadBalance::LoadBalancer g_loadBalancer;
 
 enum class OpType : uint32_t
 {
@@ -50,8 +55,15 @@ struct PER_SOCKET_CONTEXT
 	std::vector<char> tlsOutputBuffer;
 	std::vector<char> appDataBuffer;
 
+	HTTP::Parser httpParser;
+	bool isBackendConnection;
+	PER_SOCKET_CONTEXT* pairedConnection;
+	LoadBalance::Backend* selectedBackend;
+	LoadBalance::BackendPool* selectedPool;
+
+
 	// Constructor, allow uninitialized socket and set closing to false (client connection active)
-	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0), tlsEnabled(false) {}
+	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0), tlsEnabled(false), isBackendConnection(false), pairedConnection(nullptr), selectedBackend(nullptr), selectedPool(nullptr) {}
 
 	// create the Connection object
 	void enableTLS(SSL_CTX *ctx)
@@ -291,6 +303,11 @@ void safeClose(PER_SOCKET_CONTEXT *ctx)
 		ctx->socket = INVALID_SOCKET;
 	}
 	delete ctx;
+}
+
+void initializeLoadBalancer(){
+	auto& apiPool = g_loadBalancer.createPool("api-servers");
+	
 }
 
 void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
