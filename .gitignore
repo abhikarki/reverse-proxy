@@ -10,3 +10,4 @@ server.key
 server.crt
 *.pem
 README.md
+*.exe

@@ -261,54 +261,136 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	TLSClient client;
+	std::cout << "TEST 1: Testing Load Balancing with /api/ requests" << std::endl;
+std::cout << "========================================" << std::endl;
 
-	if (!client.init())
+for(int i = 0; i < 5; i++)
+{
+    TLSClient client;
+    
+    if (!client.init())
+    {
+        std::cerr << "Failed to initialize TLS" << std::endl;
+        continue;
+    }
+
+    if (!client.connect("127.0.0.1", 8080))
+    {
+        std::cerr << "Failed to connect" << std::endl;
+        continue;
+    }
+
+    std::string httpRequest = "GET /api/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    
+    int sent = client.send(httpRequest.c_str(), (int)httpRequest.size());
+    std::cout << "\nRequest " << (i+1) << " (Load Balance Test):" << std::endl;
+    
+    if(sent > 0)
+    {
+        char recvBuf[4096];
+        int recvLen = client.recv(recvBuf, sizeof(recvBuf) - 1);
+        if(recvLen > 0)
+        {
+            recvBuf[recvLen] = '\0';
+            std::string response(recvBuf);
+            size_t pos = response.find("Routed to:");
+            if(pos != std::string::npos)
+            {
+                std::cout << response.substr(pos, 50) << std::endl;
+            }
+        }
+    }
+    
+    client.disconnect();
+}
+
+std::cout << "\n\nTEST 2: Testing Rate Limiting (rapid requests)" << std::endl;
+std::cout << "========================================" << std::endl;
+
+int blocked = 0;
+for(int i = 0; i < 15; i++)
+{
+    TLSClient client;
+    
+    if (!client.init() || !client.connect("127.0.0.1", 8080))
+    {
+        continue;
+    }
+
+    std::string httpRequest = "GET /api/rate-test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    
+    int sent = client.send(httpRequest.c_str(), (int)httpRequest.size());
+    
+    if(sent > 0)
+    {
+        char recvBuf[4096];
+        int recvLen = client.recv(recvBuf, sizeof(recvBuf) - 1);
+        if(recvLen > 0)
+        {
+            recvBuf[recvLen] = '\0';
+            std::string response(recvBuf);
+            
+            if(response.find("429") != std::string::npos)
+            {
+                blocked++;
+                std::cout << "Request " << (i+1) << ": BLOCKED (429 Too Many Requests)" << std::endl;
+            }
+            else if(response.find("200") != std::string::npos)
+            {
+                std::cout << "Request " << (i+1) << ": ALLOWED (200 OK)" << std::endl;
+            }
+        }
+    }
+    
+    client.disconnect();
+}
+
+	std::cout << "\nRate Limit Summary: " << blocked << " requests blocked out of 15" << std::endl;
+
+	std::cout << "\n\nTEST 3: Testing different routes" << std::endl;
+	std::cout << "========================================" << std::endl;
+
+	std::string paths[] = {"/api/endpoint", "/static/file.js", "/api/users"};
+
+	for(const auto& path : paths)
 	{
-		std::cerr << "Failed to initialize TLS" << std::endl;
-		WSACleanup();
-		return 1;
-	}
-
-	if (!client.connect("127.0.0.1", 8080))
-	{
-		std::cerr << "Failed to connect" << std::endl;
-		WSACleanup();
-		return 1;
-	}
-
-	std::cout << "\nConnected! Type messages (or 'exit' to quit)\n" << std::endl;
-	char recvBuf[4096];
-	while(true)
-	{
-		std::string msg;
-		std::cout << "Enter message: ";
-		std::getline(std::cin, msg);
-
-		if(msg == "exit")
-			break;
-
-		msg += "\n";
-		int sent = client.send(msg.c_str(), (int)msg.size());
-		if(sent <= 0)
+		TLSClient client;
+		
+		if (!client.init() || !client.connect("127.0.0.1", 8080))
 		{
-			std::cerr << "Send Failed" << std::endl;
-			break;
+			continue;
 		}
-		std::cout << "\n>>> Sent successfully" << std::endl;
 
-		int recvLen = client.recv(recvBuf, sizeof(recvBuf) - 1);
-		if(recvLen <= 0)
+		std::string httpRequest = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+		
+		int sent = client.send(httpRequest.c_str(), (int)httpRequest.size());
+		
+		if(sent > 0)
 		{
-			std::cerr << "Recv failed or connection closed" << std::endl;
-			break;
+			char recvBuf[4096];
+			int recvLen = client.recv(recvBuf, sizeof(recvBuf) - 1);
+			if(recvLen > 0)
+			{
+				recvBuf[recvLen] = '\0';
+				std::string response(recvBuf);
+				
+				std::cout << "\nPath: " << path << std::endl;
+				size_t pos = response.find("Routed to:");
+				if(pos != std::string::npos)
+				{
+					std::cout << response.substr(pos, 50) << std::endl;
+				}
+				else if(response.find("429") != std::string::npos)
+				{
+					std::cout << "Rate limited (429)" << std::endl;
+				}
+			}
 		}
-
-		recvBuf[recvLen] = '\0';
-		std::cout << "\nServer replied: " << recvBuf << std::endl;
+		
+		client.disconnect();
 	}
 
-	client.disconnect();
+	std::cout << "\n\nAll tests completed!" << std::endl;
 	WSACleanup();
 	return 0;
 }

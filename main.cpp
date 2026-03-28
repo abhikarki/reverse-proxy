@@ -11,6 +11,7 @@
 #include <cassert>
 #include <algorithm>
 #include <thread>
+#include <sstream>
 #include "proxy.h"
 #include "tls/tls_context.h"
 #include "tls/tls_connection.h"
@@ -307,7 +308,18 @@ void safeClose(PER_SOCKET_CONTEXT *ctx)
 
 void initializeLoadBalancer(){
 	auto& apiPool = g_loadBalancer.createPool("api-servers");
-	
+	apiPool.addBackend("127.0.0.1", 3001);
+	apiPool.addBackend("127.0.0.1", 3002);
+	apiPool.addBackend("127.0.0.1", 3003);
+
+	auto& staticPool = g_loadBalancer.createPool("static-servers");
+	staticPool.addBackend("127.0.0.1", 4001);
+	staticPool.addBackend("127.0.0.1", 4002);
+
+	g_loadBalancer.addRoute(LoadBalance::Route("/api/", "*", "api-servers", 10));
+	g_loadBalancer.addRoute(LoadBalance::Route("/static/", "*", "static-servers", 10));
+
+	g_loadBalancer.setDefaultPool("api-servers");
 }
 
 void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
@@ -323,6 +335,66 @@ void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
 		return;
 	}
 
+	sockCtx->httpParser.feed(data, len);
+
+	if(sockCtx->httpParser.hasError()){
+		std::cerr << "HTTP parse error: " << sockCtx->httpParser.getError() << std::endl;
+		std::string response = HTTP::buildErrorResponse(400, sockCtx->httpParser.getError());
+		sendTLSData(sockCtx, response.c_str(), response.size());
+
+		if(!sockCtx->closing.exchange(true)){
+			CancelIoEx((HANDLE)sockCtx->socket, NULL);
+		}
+		return;
+	}
+
+	if(!sockCtx->httpParser.isComplete()){
+		return;
+	}
+
+	const HTTP::Request& request = sockCtx->httpParser.getRequest();
+
+	std::cout << "HTTP Request " << std::endl;
+    std::cout << "Method: " << request.methodStr << std::endl;
+    std::cout << "Path: " << request.path << std::endl;
+    std::cout << "Host: " << request.getHost() << std::endl;
+    std::cout << "Keep-Alive: " << (request.isKeepAlive() ? "yes" : "no") << std::endl;
+    
+	LoadBalance::Backend* backend = g_loadBalancer.selectBackendForRequest(
+		request.getHost(),
+		request.path,
+		sockCtx->clientIP
+	);
+
+	if(!backend){
+		std::cerr << "No healthy backend available" << std::endl;
+		std::string response = HTTP::buildErrorResponse(503, "No backend servers available");
+		sendTLSData(sockCtx, response.c_str(), response.size());
+		sockCtx->httpParser.reset();
+		return;
+	}
+
+	std::cout << "Selected Backend: " << backend->getAddress() << std::endl;
+
+	std::string forwardedRequest = HTTP::buildForwardedRequest(
+		request,
+		sockCtx->clientIP,
+		sockCtx->tlsEnabled
+	);
+
+	sockCtx->selectedBackend = backend;
+
+	std::cout << "Forwarded Request" << std::endl;
+	std::cout << forwardedRequest << std::endl;
+
+	std::ostringstream response;
+    response << "HTTP/1.1 200 OK\r\n";
+    response << "Content-Type: text/plain\r\n";
+    response << "Connection: " << (request.isKeepAlive() ? "keep-alive" : "close") << "\r\n";
+    std::string body = "Routed to: " + backend->getAddress() + "\n";
+    response << "Content-Length: " << body.size() << "\r\n";
+    response << "\r\n";
+    response << body;
 	
 	// Log decrypted data (should be readable)
 	std::cout << "=== DECRYPTED DATA (" << len << " bytes) ===" << std::endl;
@@ -540,6 +612,8 @@ int main(int argc, char *argv[])
 	}
 
 	std::cout << "TLS initialized successfully\n";
+
+	initializeLoadBalancer();
 
 	// Initializing a listening socket.
 	SOCKET listenSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
