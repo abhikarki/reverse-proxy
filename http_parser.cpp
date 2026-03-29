@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <sstream>
 #include <cctype>
+#include <stdio.h>
+#include <iostream>
 
 namespace HTTP
 {
@@ -160,13 +162,16 @@ namespace HTTP
     bool Parser::parseRequestLine()
     {
         size_t lineEnd = buffer.find("\r\n");
+        std::cout << "DEBUG parseRequestLine: buffer.size()=" << buffer.size() << ", lineEnd=" << lineEnd << std::endl;
         if (lineEnd == std::string::npos)
         {
             // need more data
+            std::cout << "DEBUG parseRequestLine: No complete line yet, need more data" << std::endl;
             return true;
         }
 
         std::string line = buffer.substr(0, lineEnd);
+        std::cout << "DEBUG parseRequestLine: Parsed line=[" << line << "]" << std::endl;
         buffer.erase(0, lineEnd + 2);
 
         size_t firstSpace = line.find(' ');
@@ -208,8 +213,9 @@ namespace HTTP
             errorMessage = "Unsupported HTTP version: " + request.httpVersion;
             return false;
         }
+        std::cout << "DEBUG parseRequestLine: Transitioning to HEADERS state" << std::endl;
         state = ParseState::HEADERS;
-        return true;
+        return false; // Successfully parsed request line, allow feed loop to continue
     }
 
     bool Parser::parseHeaders()
@@ -217,27 +223,37 @@ namespace HTTP
         while (true)
         {
             size_t lineEnd = buffer.find("\r\n");
+            std::cout << "DEBUG parseHeaders: buffer.size()=" << buffer.size() << ", lineEnd=" << lineEnd << std::endl;
+            if (lineEnd != std::string::npos && lineEnd < 100)
+            {
+                std::cout << "DEBUG: First line in buffer: [" << buffer.substr(0, std::min(lineEnd, size_t(100))) << "]" << std::endl;
+            }
             if (lineEnd == std::string::npos)
             {
+                std::cout << "DEBUG: No complete line yet, need more data" << std::endl;
                 return true;
             }
 
             // the headers end with \r\n\r\n, so if the first CRLF is in the beginning, we are done with the headers.
             if (lineEnd == 0)
             {
+                std::cout << "DEBUG parseHeaders: Found blank line (end of headers)" << std::endl;
                 buffer.erase(0, 2);
 
                 // check for the body
                 expectedBodyLength = request.getContentLength();
+                std::cout << "DEBUG parseHeaders: expectedBodyLength=" << expectedBodyLength << ", isChunked=" << request.isChunked() << std::endl;
 
                 if (request.isChunked())
                 {
                     // TO be implemented , right now just treating as no body
+                    std::cout << "DEBUG parseHeaders: Transitioning to COMPLETE (chunked)" << std::endl;
                     state = ParseState::COMPLETE;
                     return false;
                 }
                 else if (expectedBodyLength > 0)
                 {
+                    std::cout << "DEBUG parseHeaders: Transitioning to BODY state" << std::endl;
                     state = ParseState::BODY;
                     request.body.reserve(expectedBodyLength);
                     return true;
@@ -245,12 +261,14 @@ namespace HTTP
                 else
                 {
                     // No body
+                    std::cout << "DEBUG parseHeaders: Transitioning to COMPLETE (no body)" << std::endl;
                     state = ParseState::COMPLETE;
                     return false;
                 }
             }
 
             std::string line = buffer.substr(0, lineEnd);
+            std::cout << "DEBUG parseHeaders: Parsing header line=[" << line << "]" << std::endl;
             buffer.erase(0, lineEnd + 2);
 
             size_t colonPos = line.find(':');
@@ -263,6 +281,7 @@ namespace HTTP
 
             std::string name = trim(line.substr(0, colonPos));
             std::string value = trim(line.substr(colonPos + 1));
+            std::cout << "DEBUG parseHeaders: Header name=[" << name << "], value=[" << value << "]" << std::endl;
 
             if (name.empty())
             {
@@ -303,11 +322,14 @@ namespace HTTP
 
     bool Parser::feed(const char *data, size_t len)
     {
+        std::cout << "DEBUG feed(): state=" << (int)state << ", data_len=" << len << ", buffer_size_before=" << buffer.size() << std::endl;
         if (state == ParseState::COMPLETE || state == ParseState::PARSE_ERROR)
         {
+            std::cout << "DEBUG feed(): Already complete or error, returning false" << std::endl;
             return false;
         }
         buffer.append(data, len);
+        std::cout << "DEBUG feed(): buffer_size_after=" << buffer.size() << std::endl;
 
         constexpr size_t MAX_BUFFER_SIZE = 1024 * 1024;
         if (buffer.size() > MAX_BUFFER_SIZE)
@@ -339,6 +361,7 @@ namespace HTTP
 
             if (needMoreData || state == ParseState::COMPLETE)
             {
+                std::cout << "DEBUG feed(): Final state=" << (int)state << ", returning needMoreData=" << needMoreData << std::endl;
                 return needMoreData;
             }
         }
