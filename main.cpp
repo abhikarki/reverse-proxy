@@ -11,9 +11,12 @@
 #include <cassert>
 #include <algorithm>
 #include <thread>
+#include <sstream>
 #include "proxy.h"
 #include "tls/tls_context.h"
 #include "tls/tls_connection.h"
+#include "http_parser.h"
+#include "load_balancer.h"
 
 // #pragma comment(lib, "Ws2_32.lib");
 
@@ -24,10 +27,12 @@ constexpr int BACKLOG = 128;
 // number of bytes for addresses (IPV4). AcceptEx documentation says buffer size parameters must be at least 16 bytes greater than
 // size of address structure for the transport protocol in use
 constexpr int ACCEPT_ADDR_LEN = sizeof(sockaddr_in) + 16;
-// initialize rate limiter
-RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true));
+// initialize rate limiter 
+RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true));     // we need to disable this if testing with same IP address to prevent getting rate limited
 // TLS context
 TLS::Context g_tlsContext;
+
+LoadBalance::LoadBalancer g_loadBalancer;
 
 enum class OpType : uint32_t
 {
@@ -50,8 +55,14 @@ struct PER_SOCKET_CONTEXT
 	std::vector<char> tlsOutputBuffer;
 	std::vector<char> appDataBuffer;
 
+	HTTP::Parser httpParser;
+	bool isBackendConnection;
+	PER_SOCKET_CONTEXT *pairedConnection;
+	LoadBalance::Backend *selectedBackend;
+	LoadBalance::BackendPool *selectedPool;
+
 	// Constructor, allow uninitialized socket and set closing to false (client connection active)
-	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0), tlsEnabled(false) {}
+	PER_SOCKET_CONTEXT(SOCKET s = INVALID_SOCKET) : socket(s), closing(false), pendingIO(0), tlsEnabled(false), isBackendConnection(false), pairedConnection(nullptr), selectedBackend(nullptr), selectedPool(nullptr) {}
 
 	// create the Connection object
 	void enableTLS(SSL_CTX *ctx)
@@ -293,9 +304,27 @@ void safeClose(PER_SOCKET_CONTEXT *ctx)
 	delete ctx;
 }
 
+void initializeLoadBalancer()
+{
+	auto &apiPool = g_loadBalancer.createPool("api-servers");
+	apiPool.addBackend("127.0.0.1", 3001);
+	apiPool.addBackend("127.0.0.1", 3002);
+	apiPool.addBackend("127.0.0.1", 3003);
+
+	auto &staticPool = g_loadBalancer.createPool("static-servers");
+	staticPool.addBackend("127.0.0.1", 4001);
+	staticPool.addBackend("127.0.0.1", 4002);
+
+	g_loadBalancer.addRoute(LoadBalance::Route("/api/", "*", "api-servers", 10));
+	g_loadBalancer.addRoute(LoadBalance::Route("/static/", "*", "static-servers", 10));
+
+	g_loadBalancer.setDefaultPool("api-servers");
+}
+
 void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
 {
-	std::cout << "Received " << len << " bytes of application data\n" << std::endl;
+	std::cout << "Received " << len << " bytes of application data\n"
+			  << std::endl;
 	if (!g_rateLimiter.allowRequest(sockCtx->clientIP))
 	{
 		std::string response = RateLimit::build429Response(
@@ -306,12 +335,91 @@ void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
 		return;
 	}
 
-	
-	// Log decrypted data (should be readable)
-	std::cout << "=== DECRYPTED DATA (" << len << " bytes) ===" << std::endl;
-	std::cout << "Content: " << std::string(data, len) << std::endl;
+	sockCtx->httpParser.feed(data, len);
 
-	sendTLSData(sockCtx, data, len);
+	std::cout << "http parser feed completed" << std::endl;
+
+	if (sockCtx->httpParser.hasError())
+	{
+		std::cerr << "HTTP parse error: " << sockCtx->httpParser.getError() << std::endl;
+		std::string response = HTTP::buildErrorResponse(400, sockCtx->httpParser.getError());
+		sendTLSData(sockCtx, response.c_str(), response.size());
+
+		if (!sockCtx->closing.exchange(true))
+		{
+			CancelIoEx((HANDLE)sockCtx->socket, NULL);
+		}
+		return;
+	}
+
+	std::cout << "no error in http parser" << std::endl;
+
+	if (!sockCtx->httpParser.isComplete())
+	{
+		return;
+	}
+
+	std::cout << "parsing data complete" << std::endl;
+
+	const HTTP::Request &request = sockCtx->httpParser.getRequest();
+
+	std::cout << "HTTP Request " << std::endl;
+	std::cout << "Method: " << request.methodStr << std::endl;
+	std::cout << "Path: " << request.path << std::endl;
+	std::cout << "Host: " << request.getHost() << std::endl;
+	std::cout << "Keep-Alive: " << (request.isKeepAlive() ? "yes" : "no") << std::endl;
+
+	LoadBalance::Backend *backend = g_loadBalancer.selectBackendForRequest(
+		request.getHost(),
+		request.path,
+		sockCtx->clientIP);
+
+	if (!backend)
+	{
+		std::cerr << "No healthy backend available" << std::endl;
+		std::string response = HTTP::buildErrorResponse(503, "No backend servers available");
+		sendTLSData(sockCtx, response.c_str(), response.size());
+		sockCtx->httpParser.reset();
+		return;
+	}
+
+	std::cout << "Selected Backend: " << backend->getAddress() << std::endl;
+
+	std::string forwardedRequest = HTTP::buildForwardedRequest(
+		request,
+		sockCtx->clientIP,
+		sockCtx->tlsEnabled);
+
+	sockCtx->selectedBackend = backend;
+
+	std::cout << "Forwarded Request" << std::endl;
+	std::cout << forwardedRequest << std::endl;
+
+	std::ostringstream response;
+	response << "HTTP/1.1 200 OK\r\n";
+	response << "X-Routed-To: " << backend->getAddress() << "\r\n";
+	response << "Content-Type: text/plain\r\n";
+	response << "Connection: " << (request.isKeepAlive() ? "keep-alive" : "close") << "\r\n";
+	std::string body = "Request routed to backend: " + backend->getAddress() + "\n";
+	response << "Content-Length: " << body.size() << "\r\n";
+	response << "\r\n";
+	response << body;
+
+	std::string responseStr = response.str();
+	sendTLSData(sockCtx, responseStr.c_str(), responseStr.size());
+
+	// Reset parser for keep-alive or close connection
+	if (request.isKeepAlive())
+	{
+		sockCtx->httpParser.reset();
+	}
+	else
+	{
+		if (!sockCtx->closing.exchange(true))
+		{
+			CancelIoEx((HANDLE)sockCtx->socket, NULL);
+		}
+	}
 }
 
 // handling raw encrypted data from the network, including the first ClientHello message itself
@@ -523,6 +631,8 @@ int main(int argc, char *argv[])
 	}
 
 	std::cout << "TLS initialized successfully\n";
+
+	initializeLoadBalancer();
 
 	// Initializing a listening socket.
 	SOCKET listenSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);

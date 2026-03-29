@@ -10,7 +10,7 @@ OPENSSL_INC = -I$(OPENSSL_DIR)/include
 OPENSSL_LIB = -L$(OPENSSL_DIR)/lib -lssl -lcrypto
 
 TARGET = main.exe
-SRCS = main.cpp rate_limit.cpp
+SRCS = main.cpp rate_limit.cpp load_balancer.cpp http_parser.cpp
 
 # Build
 $(TARGET): $(SRCS) proxy.h tls/tls_context.h tls/tls_connection.h
