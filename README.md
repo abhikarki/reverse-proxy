@@ -7,7 +7,7 @@ An asynchronous, multi-threaded reverse proxy for Windows, designed to efficient
 - **Asynchronous I/O:** Uses IOCP (I/O Completion Ports) for scalable, non-blocking networking.
 - **Multi-threaded:** Worker thread pool for efficient event handling.
 - **TLS Termination:** Secure connections with OpenSSL, including session caching for fast resumption.
-- **Per-client Rate Limiting:** Prevents abuse and application-layer attacks.
+- **Per-client IP Rate Limiting:** Prevents abuse and application-layer attacks.
 - **Load Balancing:** Intelligent request distribution across multiple backend servers with multiple algorithms (Round Robin, Least Connections, Weighted Round Robin, IP Hash, Random). Route-based pool management for different services.
 - **Connection Management:** Robust handling of thousands of concurrent sockets.
 
