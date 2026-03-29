@@ -27,8 +27,8 @@ constexpr int BACKLOG = 128;
 // number of bytes for addresses (IPV4). AcceptEx documentation says buffer size parameters must be at least 16 bytes greater than
 // size of address structure for the transport protocol in use
 constexpr int ACCEPT_ADDR_LEN = sizeof(sockaddr_in) + 16;
-// initialize rate limiter (disabled for testing)
-RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, false));
+// initialize rate limiter 
+RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true));     // we need to disable this if testing with same IP address to prevent getting rate limited
 // TLS context
 TLS::Context g_tlsContext;
 
