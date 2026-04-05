@@ -66,7 +66,7 @@ namespace HTTP
             ~BufferManager() = default;
 
             bool append(const char *data, size_t len);
-            std::string extractLine();
+            std::optional<std::string> extractLine();
             std::string peek(size_t len) const;
             void consume(size_t len);
             size_t available() const {return writePos - readPos;}

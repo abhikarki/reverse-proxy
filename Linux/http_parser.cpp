@@ -49,7 +49,7 @@ namespace HTTP{
         return true;
     }
 
-    std::string BufferManager::extractLine()
+    std::optional<std::string> BufferManager::extractLine()
     {
         const char *start = buffer.data() + readPos;
         const char *end = start;
@@ -66,7 +66,7 @@ namespace HTTP{
             }
         }
 
-        return ""; // No complete line
+        return std::nullopt; // No \r\n found
     }
 
     // peek and consume is needed for body because the body could have \r\n as part of its data and extractLine maynot be
@@ -234,11 +234,12 @@ namespace HTTP{
     }
 
     bool Parser::parseRequestLine(){
-        std::string line = buffer.extractLine();
-        if(line.empty()){
+        auto lineOpt = buffer.extractLine();
+        if(!lineOpt.has_value()){
             return true;
         }
 
+        std::string line = lineOpt.value();
         if(!line.empty() && line.back() == '\r'){
             line.pop_back();
         }
@@ -291,11 +292,13 @@ namespace HTTP{
     {
         while (buffer.available() > 0)
         {
-            std::string line = buffer.extractLine();
-            if (line.empty())
+            auto lineOpt = buffer.extractLine();
+            if (!lineOpt.has_value())
             {
-                return true; 
+                return true;   // need more data, no \r\n found
             }
+
+            std::string line = lineOpt.value();
 
             if (!line.empty() && line.back() == '\r')
             {
