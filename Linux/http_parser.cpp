@@ -8,37 +8,46 @@
 #include <stdio.h>
 #include <iostream>
 
-
-namespace HTTP{
-    BufferManager::BufferManager(size_t initialSize) : readPos(0), writePos(0), capacity(initialSize) {
+namespace HTTP
+{
+    BufferManager::BufferManager(size_t initialSize) : readPos(0), writePos(0), capacity(initialSize)
+    {
         buffer.resize(capacity);
     }
 
-    bool BufferManager::append(const char *data, size_t len){
-        if(!data || len == 0){
+    bool BufferManager::append(const char *data, size_t len)
+    {
+        if (!data || len == 0)
+        {
             return true;
         }
 
         size_t requiredSpace = writePos + len;
-        
-        if(requiredSpace > capacity){
-            if(readPos > 0){
+
+        if (requiredSpace > capacity)
+        {
+            if (readPos > 0)
+            {
                 size_t validData = writePos - readPos;
                 std::memmove(buffer.data(), buffer.data() + readPos, validData);
                 readPos = 0;
                 writePos = validData;
             }
 
-            if(writePos + len > capacity){
-                while(capacity < writePos + len){
+            if (writePos + len > capacity)
+            {
+                while (capacity < writePos + len)
+                {
                     capacity *= 2;
-                    if(capacity > MAX_REQUEST_SIZE){
+                    if (capacity > MAX_REQUEST_SIZE)
+                    {
                         capacity = MAX_REQUEST_SIZE;
                         break;
                     }
                 }
 
-                if(writePos + len > capacity) return false;
+                if (writePos + len > capacity)
+                    return false;
 
                 buffer.resize(capacity);
             }
@@ -71,36 +80,43 @@ namespace HTTP{
 
     // peek and consume is needed for body because the body could have \r\n as part of its data and extractLine maynot be
     // used in such condition
-    std::string BufferManager::peek(size_t len) const{
+    std::string BufferManager::peek(size_t len) const
+    {
         size_t available = writePos - readPos;
         size_t toPeek = std::min(len, available);
         return std::string(buffer.data() + readPos, toPeek);
     }
 
-    void BufferManager::consume(size_t len){
+    void BufferManager::consume(size_t len)
+    {
         size_t available = writePos - readPos;
         readPos += std::min(len, available);
     }
 
-    void BufferManager::reset(){
+    void BufferManager::reset()
+    {
         readPos = 0;
         writePos = 0;
     }
 
-
-    std::string Request::getHeader(const std::string &name) const{
+    std::string Request::getHeader(const std::string &name) const
+    {
         std::string lowerName;
         lowerName.reserve(name.size());
-        for(char c : name){
+        for (char c : name)
+        {
             lowerName += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-        for(const auto &pair : headers){
+        for (const auto &pair : headers)
+        {
             std::string lowerKey;
             lowerKey.reserve(pair.first.size());
-            for(char c : pair.first){
+            for (char c : pair.first)
+            {
                 lowerKey += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
-            if(lowerKey == lowerName){
+            if (lowerKey == lowerName)
+            {
                 return pair.second;
             }
         }
@@ -118,15 +134,19 @@ namespace HTTP{
         return headers.find(lowerName) != headers.end();
     }
 
-    size_t Request::getContentLength() const {
+    size_t Request::getContentLength() const
+    {
         std::string value = getHeader("Content-Length");
-        if(value.empty()){
+        if (value.empty())
+        {
             return 0;
         }
-        try{
+        try
+        {
             return std::stoull(value);
         }
-        catch(...){
+        catch (...)
+        {
             return 0;
         }
     }
@@ -175,7 +195,8 @@ namespace HTTP{
     {
     }
 
-    void Parser::reset(){
+    void Parser::reset()
+    {
         state = ParseState::REQUEST_LINE;
         buffer.reset();
         request = Request();
@@ -184,34 +205,41 @@ namespace HTTP{
         errorMessage.clear();
     }
 
-    inline std::string Parser::trim(const std::string &str){
+    inline std::string Parser::trim(const std::string &str)
+    {
         size_t start = 0, end = str.size();
-        
-        while(start < end && isWhitespace(str[start])) start++;
 
-        while(end > start && isWhitespace(str[end - 1])) end--;
+        while (start < end && isWhitespace(str[start]))
+            start++;
+
+        while (end > start && isWhitespace(str[end - 1]))
+            end--;
 
         return str.substr(start, end - start);
     }
 
-    inline std::string Parser::toLower(const std::string &str){
+    inline std::string toLower(const std::string &str)
+    {
         std::string result;
         result.reserve(str.size());
 
-        for(char c : str){
+        for (char c : str)
+        {
             result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
         return result;
     }
 
-
-    inline void Parser::toLowerInPlace(std::string &str){
-        for(char &c : str){
+    inline void Parser::toLowerInPlace(std::string &str)
+    {
+        for (char &c : str)
+        {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
     }
 
-    Method Parser::stringToMethod(const std::string &str){
+    Method Parser::stringToMethod(const std::string &str)
+    {
         if (str == "GET")
             return Method::GET;
         if (str == "POST")
@@ -233,14 +261,17 @@ namespace HTTP{
         return Method::UNKNOWN;
     }
 
-    bool Parser::parseRequestLine(){
+    bool Parser::parseRequestLine()
+    {
         auto lineOpt = buffer.extractLine();
-        if(!lineOpt.has_value()){
+        if (!lineOpt.has_value())
+        {
             return true;
         }
 
         std::string line = lineOpt.value();
-        if(!line.empty() && line.back() == '\r'){
+        if (!line.empty() && line.back() == '\r')
+        {
             line.pop_back();
         }
 
@@ -295,7 +326,7 @@ namespace HTTP{
             auto lineOpt = buffer.extractLine();
             if (!lineOpt.has_value())
             {
-                return true;   // need more data, no \r\n found
+                return true; // need more data, no \r\n found
             }
 
             std::string line = lineOpt.value();
@@ -483,7 +514,7 @@ namespace HTTP{
     std::string buildErrorResponse(int statusCode, const std::string &message)
     {
         const char *statusText = "Error";
-        
+
         switch (statusCode)
         {
         case 400:

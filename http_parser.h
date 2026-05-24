@@ -50,6 +50,9 @@ namespace HTTP
         std::string getHost() const;
     };
 
+    // Utility functions
+    std::string toLower(const std::string &str);
+
     class Parser
     {
     private:
@@ -67,7 +70,6 @@ namespace HTTP
         bool parseBody();
         Method stringToMethod(const std::string &str);
         std::string trim(const std::string &str);
-        std::string toLower(const std::string &str);
 
     public:
         Parser();

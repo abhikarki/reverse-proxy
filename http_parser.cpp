@@ -125,7 +125,7 @@ namespace HTTP
         return str.substr(start, end - start);
     }
 
-    std::string Parser::toLower(const std::string &str)
+    std::string toLower(const std::string &str)
     {
         std::string result;
         result.reserve(str.size());
