@@ -38,7 +38,10 @@ enum class OpType : uint32_t
 {
 	READ = 1,
 	WRITE = 2,
-	ACCEPT = 3
+	ACCEPT = 3,
+	CONNECT_UPSTREAM = 4,
+	READ_UPSTREAM = 5,
+	WRITE_UPSTREAM = 6
 };
 
 struct PER_SOCKET_CONTEXT
