@@ -95,8 +95,10 @@ struct PER_IO_OPERATION_DATA
 	OpType opType;
 	DWORD flags;
 	SOCKET acceptSocket; // for opType == Accept
+	SOCKET upstreamSocket;  // for opType == CONNECT_UPSTREAM, READ_UPSTREAM, WRITE_UPSTREAM
+	PER_SOCKET_CONTEXT *upstreamCtx;  // context for upstream socket operations
 	// Constructor
-	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0), acceptSocket(INVALID_SOCKET)
+	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0), acceptSocket(INVALID_SOCKET), upstreamSocket(INVALID_SOCKET), upstreamCtx(nullptr)
 	{
 		// set all members of overlapped to zero
 		ZeroMemory(&overlapped, sizeof(overlapped));
@@ -116,6 +118,11 @@ struct PER_IO_OPERATION_DATA
 		{
 			closesocket(acceptSocket);
 			acceptSocket = INVALID_SOCKET;
+		}
+
+		if(upstreamSocket != INVALID_SOCKET){
+			closesocket(upstreamSocket);
+			upstreamSocket = INVALID_SOCKET;
 		}
 	}
 };
