@@ -32,5 +32,5 @@ namespace Upstream{
             void close();
 
             SOCKET release();
-    }
+    };
 }
