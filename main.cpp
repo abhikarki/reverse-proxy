@@ -17,6 +17,7 @@
 #include "tls/tls_connection.h"
 #include "http_parser.h"
 #include "load_balancer.h"
+#include "upstream.h"
 
 // #pragma comment(lib, "Ws2_32.lib");
 
@@ -79,7 +80,7 @@ struct PER_SOCKET_CONTEXT
 void sendTLSPendingData(PER_SOCKET_CONTEXT *sockCtx);
 void sendTLSData(PER_SOCKET_CONTEXT *sockCtx, const char *plainData, size_t len);
 void handleTLSRead(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD bytesReceived);
-void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len);
+void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len, HANDLE iocp);
 
 void print_wsa_error(const char *msg)
 {
@@ -264,6 +265,70 @@ PER_IO_OPERATION_DATA *post_accept(HANDLE iocp)
 	return ioData;
 }
 
+PER_IO_OPERATION_DATA *post_connect_upstream(PER_SOCKET_CONTEXT *upstreamCtx, const std::string& host, unsigned short port, HANDLE iocp){
+	auto *ioData = new PER_IO_OPERATION_DATA(OpType::CONNECT_UPSTREAM);
+	ioData->upstreamSocket = upstreamCtx->socket;
+	ioData->upstreamCtx = upstreamCtx;
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+
+	int rc = inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+	if(rc != 1){
+		std::cerr << "Failed to parse backend host: " << host << std::endl;
+		delete ioData;
+		return nullptr;
+	}
+
+	LPFN_CONNECTEX lpfnConnectEx = nullprt;
+	GUID guidConnectEx = WSAIT_CONNECTEX;
+	DWORD bytes = 0;
+
+	rc = WSAIoctl(
+		upstreamCtx->socket,
+		SIO_GET_EXTENSION_FUNCTION_POINTER,
+		&guidConnectEx,
+		sizeof(guidConnectEx),
+		&lpfnConnectEx,
+		sizeof(lpfnConnectEx),
+		&bytes,
+		nullptr,
+		nullptr
+	);
+
+	if(rc == SOCKET_ERROR || !lpfnConnectEx){
+		std::cerr << "Failed to get ConnectEx function pointer" << std::endl;
+		delete ioData;
+		return nullptr;
+	}
+
+	upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+	BOOL ok = lpfnConnectEx(
+		upstreamCtx->socket,
+		(sockaddr*)&addr,
+		sizeof(addr),
+		nullptr,
+		0,
+		nullptr,
+		&ioData->overlapped
+	);
+
+	if(!ok){
+		int err = WSAGetLastError();
+		if(err != WSA_IO_PENDING){
+			upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+			std::cerr << "ConnectEx failed: " << err << std::endl;
+			delete ioData;
+			return nullptr;
+		}
+	}
+
+	std::cout << "ConnectEx posted to backend: " << host << ":" << port << std::endl;
+	return ioData;
+}
+
 // when successful g_AcceptEx contains the pointer to the AcceptEx() function
 bool init_acceptex(SOCKET listenSock)
 {
@@ -331,7 +396,7 @@ void initializeLoadBalancer()
 	g_loadBalancer.setDefaultPool("api-servers");
 }
 
-void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
+void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len, HANDLE iocp)
 {
 	std::cout << "Received " << len << " bytes of application data\n"
 			  << std::endl;
@@ -398,12 +463,35 @@ void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
 	std::string forwardedRequest = HTTP::buildForwardedRequest(
 		request,
 		sockCtx->clientIP,
-		sockCtx->tlsEnabled);
+		sockCtx->tlsEnabled
+	);
 
-	sockCtx->selectedBackend = backend;
-
-	std::cout << "Forwarded Request" << std::endl;
+	std::cout << "Forwarded Request to backend" << std::endl;
 	std::cout << forwardedRequest << std::endl;
+
+	PER_SOCKET_CONTEXT *upstreamCtx = new PER_SOCKET_CONTEXT();
+	upstreamCtx->clientIP = "upstream-" + backend->getAddress();
+	upstreamCtx->isBackendConnection = true;
+
+	sockCtx->pairedConnection = upstreamCtx;
+	upstreamCtx->pairedConnection = sockCtx;
+
+	auto upstreamConn = std::make_unique<Upstream::Connection>(backend->host, backend->port);
+
+	if(!upstreamConn->initiateAsyncConnect(iocp)){
+		std::cerr << "Failed to initiate upstream connection" << std::endl;
+		std::string response = HTTP::buildErrorResponse(503, "Failed to connect to backend");
+		sendTLSData(sockCtx, response.c_str(), response.size());
+
+		upstreamCtx->pairedConnection = nullptr;
+		sockCtx->pairedConnection = nullptr;
+		delete upstreamCtx;
+		return;
+	}
+
+	upstreamCtx->socket = upstreamConn->getSocket();
+
+	upstreamCtx->appDataBuffer.assign(forwardedRequest.begin(), forwardedRequest.end());
 
 	std::ostringstream response;
 	response << "HTTP/1.1 200 OK\r\n";
@@ -446,7 +534,7 @@ void handleTLSRead(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD bytesRec
 	std::cout << std::endl;
 	if (!sockCtx->tlsEnabled)
 	{
-		processPlainData(sockCtx, data, bytesReceived);
+		processPlainData(sockCtx, data, bytesReceived, iocp);
 		return;
 	}
 
@@ -483,7 +571,7 @@ void handleTLSRead(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD bytesRec
 			TLS::IOResult readResult = tls->read(plainBuffer, sizeof(plainBuffer), bytesRead);
 			if (readResult == TLS::IOResult::SUCCESS && bytesRead > 0)
 			{
-				processPlainData(sockCtx, plainBuffer, static_cast<DWORD>(bytesRead));
+				processPlainData(sockCtx, plainBuffer, static_cast<DWORD>(bytesRead), iocp);
 			}
 			// next post_recv is posted by the worker thread after this function returns.
 		}
@@ -515,7 +603,7 @@ void handleTLSRead(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD bytesRec
 
 		if (result == TLS::IOResult::SUCCESS && bytesRead > 0)
 		{
-			processPlainData(sockCtx, plainBuffer, static_cast<DWORD>(bytesRead));
+			processPlainData(sockCtx, plainBuffer, static_cast<DWORD>(bytesRead), iocp);
 		}
 		else if (result == TLS::IOResult::WANT_READ)
 		{
