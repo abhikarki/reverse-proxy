@@ -1072,6 +1072,66 @@ int main(int argc, char *argv[])
 					}
 					delete ioData;
 				}
+				else if(ioData->opType == OpType::READ_UPSTREAM){
+					PER_SOCKET_CONTEXT* upstreamCtx = ioData->upstreamCtx;
+					PER_SOCKET_CONTEXT* clientCtx = upstreamCtx->pairedConnection;
+
+					if(bytesTransferred == 0){
+						std::cout << "Backend disconnected" << std::endl;
+						if(clientCtx && !clientCtx->closing.exchange(true)){
+							CancelIoEx((HANDLE)clientCtx->socket, NULL);
+						}
+						if(!upstreamCtx->closing.exchange(true)){
+							CancelIoEx((HANDLE)upstreamCtx->socket, NULL);
+						}
+						upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+						delete ioData;
+						continue;
+					}
+
+					std::cout << "Read" << bytesTransferred << " bytes from backend" << std::endl;
+
+					if(clientCtx && clientCtx->tlsEnabled){
+						sendTLSData(clientCtx, ioData->buffer, bytesTransferred);
+					}
+					else if(clientCtx){
+						post_send(clientCtx, ioData->buffer, bytesTransferred);
+					}
+
+					upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+
+					if(!upstreamCtx->closing.load()){
+						PER_IO_OPERATION_DATA* nextRecv = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
+						nextRecv->buffer = new char[BUF_SIZE];
+						nextRecv->wsaBuf.buf = nextRecv->buffer;
+						nextRecv->wsaBuf.len = BUF_SIZE;
+						nextRecv->upstreamCtx = upstreamCtx;
+						nextRecv->upstreamSocket = upstreamCtx->socket;
+						ZeroMemory(&nextRecv->overlapped, sizeof(nextRecv->overlapped));
+
+						upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+						DWORD bytesReceived = 0;
+						int rc = WSARecv(
+							upstreamCtx->socket,
+							&nextRecv->wsaBuf;
+							1,
+							&bytesReceived,
+							&nextRecv->flags,
+							&nextRecv->overlapped,
+							nullptr
+						);
+					
+					if(rc == SOCKET_ERROR){
+						int recvErr = WSAGetLastError();
+						if(recvErr != WSA_IO_PENDING){
+							upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+							delete nextRecv;
+						}
+					}
+					}
+					delete ioData;
+				}
 				else if (ioData->opType == OpType::WRITE) {
 					std::cout << "Write complete: " << bytesTransferred << std::endl;
 					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
