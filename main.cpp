@@ -951,6 +951,79 @@ int main(int argc, char *argv[])
 					continue;
 				}
 
+				if(ioData->opType == OpType::CONNECT_UPSTREAM){
+					PER_SOCKET_CONTEXT* upstreamCtx = ioData->upstreamCtx;
+					PER_SOCKET_CONTEXT* clientCtx = upstreamCtx->pairedConnection;
+
+					DWORD err = 0;
+					if(!ok){
+						err = GetLastError();
+						std::cerr << "ConnectEx failed: " << err << std::endl;
+
+						if(clientCtx){
+							std::string response = HTTP::buildErrorResponse(503, "Failed to connect to backend");
+							sendTLSData(clientCtx, response.c_str(), response.size());
+							if(!clientCtx->closing.exchange(true)){
+								CancelIoEx((HANDLE)clientCtx->socket, NULL);
+							}
+						}
+
+						upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+						if(!upstreamCtx->closing.exchange(true)){
+							CancelIoEx((HANDLE)upstreamCtx->socket, NULL);
+						}
+						delete ioData;
+						continue;
+					}
+
+					std::cout << "Connected to upstream backend" << std::endl;
+					upstreamCtx->markConnected();
+
+					if(!upstreamCtx->appDataBuffer.empty()){
+						PER_IO_OPERATION_DATA* sendOp = post_send(upstreamCtx,
+							upstreamCtx->appDataBuffer.data(),
+						    static_cast<DWORD>(upstreamCtx->appDataBuffer.size()));
+
+						if(!sendOp){
+							std::cerr << "Failed to post send to upstream" << std::endl;
+						}
+					}
+
+					upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+					delete ioData;
+
+					PER_IO_OPERATION_DATA* recvOp = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
+					recvOp->buffer = new char[BUF_SIZE];
+					recvOp->wsaBuf.buf = recvOp->buffer;
+					recvOp->wsaBuf.len = BUF_SIZE;
+					recvOp->upstreamCtx = upstreamCtx;
+					recvOp->upstreamSocket = upstreamCtx->socket;
+					ZeroMemory(&recvOp->overlapped, sizeof(recvOp->overlapped));
+
+					upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+					DWORD bytesReceived = 0;
+					int rc = WSARecv(
+						upstreamCtx->socket,
+						&recvOp->wsaBuf,
+						1,
+						&bytesReceived,
+						&recvOp->flags,
+						&recvOp->overlapped,
+						nullptr
+					);
+
+					if(rc == SOCKET_ERROR){
+						int recvErr = WSAGetLastError();
+						if(recvErr != WSA_IO_PENDING){
+							std::cerr << "WSARecv on upstream failed: " << recvErr << std::endl;
+							upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+							delete recvOp;
+						}
+					}
+					continue;
+				}
+
 
 				// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
 				// Here, we close the socket operations, deallocate memory
