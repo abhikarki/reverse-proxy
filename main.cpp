@@ -1140,6 +1140,17 @@ int main(int argc, char *argv[])
 					}
 					delete ioData;
 				}
+				else if(ioData->opType == OpType::WRITE_UPSTREAM){
+					std::cout << "Write to upstream complete: " << bytesTransferred << std::endl;
+
+					if(ioData->upstreamCtx){
+						ioData->upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+						if(ioData->upstreamCtx->pendingIO.load() == 0 && ioData->upstreamCtx->closing.load()){
+							safeClose(ioData->upstreamCtx);
+						}
+					}
+					delete ioData;
+				}
 				else {
 					std::cerr << "Unknown OpType" << std::endl;
 					delete ioData;
