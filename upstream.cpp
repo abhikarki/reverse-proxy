@@ -31,38 +31,6 @@ namespace Upstream{
             return false;
         }
 
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-
-        int rc = inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-        if(rc != 1){
-            std::cerr << "Failed to parse backend host: " << host << std::endl;
-            return false;
-        }
-
-        LPFN_CONNECTEX lpfnConnectEx = nullptr;
-        GUID guidConnectEx = WSAID_CONNECTEX;
-        DWORD bytes = 0;
-
-        rc = WSAIoctl(
-            socket,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            &guidConnectEx,
-            sizeof(guidConnectEx),
-            &lpfnConnectEx,
-            sizeof(lpfnConnectEx),
-            &bytes,
-            nullptr,
-            nullptr
-        );
-
-        if(rc == SOCKET_ERROR || !lpfnConnectEx){
-            int err = WSAGetLastError();
-            std::cerr << "Failed to get ConnectEx function pointer: " << err << std::endl;
-            return false;
-        }
-
         sockaddr_in localAddr{};
         localAddr.sin_family = AF_INET;
         localAddr.sin_addr.s_addr = INADDR_ANY;
