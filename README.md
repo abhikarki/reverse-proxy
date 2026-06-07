@@ -17,6 +17,23 @@ For each client connection, it is ensured that only at most one WSARecv call is 
 Once the send is completed, a thread is awakened which acquires the mutex, sets the isSendBusy (a boolean to track if any send to upstream is pending) to false, starts a new send, sets isSendBusy to true and releases the lock.
 The mutex helps us to solve the producer-consumer problem by granting access of the buffer to only one thread.
 <img width="1736" height="914" alt="workflow1-reverseproxy" src="https://github.com/user-attachments/assets/75b000ab-07c2-4388-b45f-352943ba6c3f" />
+#### Potential Deadlock Scenario and How this Architecture solves it
+One important point to note from the workflow is that any update to the boolean flag ***isSendBusy*** must always occur after the thread has acquired the mutex. Without this the following situation can occur:
+```
+Thread A                                 Thread B
+aquire mutex.lock()                      isSendBusy = false
+     # critical section                  acquire mutex.lock()
+     if (!isSendBusy):                    if (!buffer.empty()):
+        copy to buffer                       post send
+        post send                            isSendBusy = true
+        isSendBusy = true                else:
+     else:                                   do nothing 
+        copy to buffer                   release mutex.lock()
+release mutex.lock()
+```
+Consider that client just sent data (buffer is empty) and Thread B acquired the lock before Thread A. In the above scenario, due to CPU memory order operations, the isSendBusy = false might not complete until after the lock is released in Thread B. This means the thread B does nothing and releases the lock. But just before thread B sets isSendBusy to false, Thread A might acquire the lock and read the isSendBusy value (which is still True). Then, Thread A just copies to buffer and releases the lock. 
+Now, the buffer has some data and isSendBusy is false, which means that only way the data in the buffer will be sent to upstream is if client sends data again and awakens Thread A logic. If not, the data remains in buffer and not get sent to upstream server and client keeps waiting for server's response to send new data. This results in a deadlock.
+Therefore, any update to the isSendBusy must occur after acquiring the lock and before realeasing as shown in the workflow diagram and as followed in the project.
 
 
 ### System Architecture And Workflow
