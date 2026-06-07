@@ -31,8 +31,8 @@ aquire mutex.lock()                      isSendBusy = false
         copy to buffer                   release mutex.lock()
 release mutex.lock()
 ```
-Consider that client just sent data (buffer is empty) and Thread B acquired the lock before Thread A. In the above scenario, due to CPU memory order operations, the isSendBusy = false might not complete until after the lock is released in Thread B. This means the thread B does nothing and releases the lock. But just before thread B sets isSendBusy to false, Thread A might acquire the lock and read the isSendBusy value (which is still True). Then, Thread A just copies to buffer and releases the lock. 
-Now, the buffer has some data and isSendBusy is false, which means that only way the data in the buffer will be sent to upstream is if client sends data again and awakens Thread A logic. If not, the data remains in buffer and not get sent to upstream server and client keeps waiting for server's response to send new data. This results in a deadlock.
+Consider that client just sent data (buffer is empty) and Thread B acquired the lock before Thread A. In the above scenario, due to CPU memory order operations, the isSendBusy = false might not complete until after the lock is released in Thread B. This means the thread B does nothing and releases the lock. But just before thread B sets isSendBusy to false, Thread A might acquire the lock and read the isSendBusy value (which is still True). Then, Thread A just copies to buffer and releases the lock. <p>
+Now, the buffer has some data and isSendBusy is false, which means that only way the data in the buffer will be sent to upstream is if client sends data again and awakens Thread A logic. If not, the data remains in buffer and not get sent to upstream server and client keeps waiting for server's response to send new data. This results in a deadlock. <p>
 Therefore, any update to the isSendBusy must occur after acquiring the lock and before realeasing as shown in the workflow diagram and as followed in the project.
 
 
