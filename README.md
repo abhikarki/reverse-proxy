@@ -11,6 +11,10 @@ An asynchronous, multi-threaded reverse proxy (for both Windows & Linux), design
 - **Load Balancing:** Intelligent request distribution across multiple backend servers with multiple algorithms (Round Robin, Least Connections, Weighted Round Robin, IP Hash, Random). Route-based pool management for different services.
 - **Connection Management:** Robust handling of thousands of concurrent sockets.
 
+### Workflow 1 - read from client and send to upstream
+
+<img width="1736" height="914" alt="workflow1-reverseproxy" src="https://github.com/user-attachments/assets/75b000ab-07c2-4388-b45f-352943ba6c3f" />
+
 
 ### System Architecture And Workflow
 
