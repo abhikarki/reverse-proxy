@@ -12,7 +12,10 @@ An asynchronous, multi-threaded reverse proxy (for both Windows & Linux), design
 - **Connection Management:** Robust handling of thousands of concurrent sockets.
 
 ### Workflow 1 - read from client and send to upstream
-
+To achieve maximum network throughput without data corruption, the client-to-upstream data flow operates under a strict producer-consumer model with a single connection-specific mutex lock.
+For each client connection, it is ensured that only at most one WSARecv call is pending at any time so that the data from client is processed in the same order as received. When data arrives, a single worker thread from the pool is awakened by IOCP. This thread performs the necessary application logic such as rate limiting and load balancing. Then, it acquires a lock to put data into the buffer and send it to upstream if no send if pending.
+Once the send is completed, a thread is awakened which acquires the mutex, sets the isSendBusy (a boolean to track if any send to upstream is pending) to false, starts a new send, sets isSendBusy to true and releases the lock.
+The mutex helps us to solve the producer-consumer problem by granting access of the buffer to only one thread.
 <img width="1736" height="914" alt="workflow1-reverseproxy" src="https://github.com/user-attachments/assets/75b000ab-07c2-4388-b45f-352943ba6c3f" />
 
 
