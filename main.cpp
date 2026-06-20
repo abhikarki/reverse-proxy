@@ -12,11 +12,13 @@
 #include <algorithm>
 #include <thread>
 #include <sstream>
+#include <mutex>
 #include "proxy.h"
 #include "tls/tls_context.h"
 #include "tls/tls_connection.h"
 #include "http_parser.h"
 #include "load_balancer.h"
+#include "upstream.h"
 
 // #pragma comment(lib, "Ws2_32.lib");
 
@@ -27,8 +29,8 @@ constexpr int BACKLOG = 128;
 // number of bytes for addresses (IPV4). AcceptEx documentation says buffer size parameters must be at least 16 bytes greater than
 // size of address structure for the transport protocol in use
 constexpr int ACCEPT_ADDR_LEN = sizeof(sockaddr_in) + 16;
-// initialize rate limiter 
-RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true));     // we need to disable this if testing with same IP address to prevent getting rate limited
+// initialize rate limiter
+RateLimit::Limiter g_rateLimiter(RateLimit::Config(100.0, 10.0, true)); // we need to disable this if testing with same IP address to prevent getting rate limited
 // TLS context
 TLS::Context g_tlsContext;
 
@@ -38,7 +40,10 @@ enum class OpType : uint32_t
 {
 	READ = 1,
 	WRITE = 2,
-	ACCEPT = 3
+	ACCEPT = 3,
+	CONNECT_UPSTREAM = 4,
+	READ_UPSTREAM = 5,
+	WRITE_UPSTREAM = 6
 };
 
 struct PER_SOCKET_CONTEXT
@@ -53,7 +58,14 @@ struct PER_SOCKET_CONTEXT
 
 	std::vector<char> tlsInputBuffer;
 	std::vector<char> tlsOutputBuffer;
-	std::vector<char> appDataBuffer;
+
+	std::vector<char> clientToUpstreamBuffer;
+	std::mutex clientToUpstreamMutex;
+	std::atomic<bool> upstreamSendBusy{false};
+
+	std::vector<char> upstreamToClientBuffer;
+	std::mutex upstreamToClientMutex;
+	std::atomic<bool> clientSendBusy{false};
 
 	HTTP::Parser httpParser;
 	bool isBackendConnection;
@@ -91,9 +103,11 @@ struct PER_IO_OPERATION_DATA
 	char *buffer;
 	OpType opType;
 	DWORD flags;
-	SOCKET acceptSocket; // for opType == Accept
+	SOCKET acceptSocket;			 // for opType == Accept
+	SOCKET upstreamSocket;			 // for opType == CONNECT_UPSTREAM, READ_UPSTREAM, WRITE_UPSTREAM
+	PER_SOCKET_CONTEXT *upstreamCtx; // context for upstream socket operations
 	// Constructor
-	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0), acceptSocket(INVALID_SOCKET)
+	PER_IO_OPERATION_DATA(OpType t = OpType::READ) : buffer(nullptr), opType(t), flags(0), acceptSocket(INVALID_SOCKET), upstreamSocket(INVALID_SOCKET), upstreamCtx(nullptr)
 	{
 		// set all members of overlapped to zero
 		ZeroMemory(&overlapped, sizeof(overlapped));
@@ -114,6 +128,12 @@ struct PER_IO_OPERATION_DATA
 			closesocket(acceptSocket);
 			acceptSocket = INVALID_SOCKET;
 		}
+
+		if (upstreamSocket != INVALID_SOCKET)
+		{
+			closesocket(upstreamSocket);
+			upstreamSocket = INVALID_SOCKET;
+		}
 	}
 };
 
@@ -130,6 +150,7 @@ typedef BOOL(PASCAL *LPFN_ACCEPTEX)(
 
 LPFN_ACCEPTEX g_AcceptEx = nullptr;
 SOCKET g_listenSocket = INVALID_SOCKET;
+HANDLE g_iocp = nullptr; // Global IOCP handle for all socket operations
 
 PER_IO_OPERATION_DATA *post_recv(PER_SOCKET_CONTEXT *sockCtx)
 {
@@ -254,6 +275,111 @@ PER_IO_OPERATION_DATA *post_accept(HANDLE iocp)
 	return ioData;
 }
 
+PER_IO_OPERATION_DATA *post_connect_upstream(PER_SOCKET_CONTEXT *upstreamCtx, const std::string &host, unsigned short port, HANDLE iocp)
+{
+	auto *ioData = new PER_IO_OPERATION_DATA(OpType::CONNECT_UPSTREAM);
+	ioData->upstreamSocket = upstreamCtx->socket;
+	ioData->upstreamCtx = upstreamCtx;
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+
+	int rc = inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+	if (rc != 1)
+	{
+		std::cerr << "Failed to parse backend host: " << host << std::endl;
+		delete ioData;
+		return nullptr;
+	}
+
+	LPFN_CONNECTEX lpfnConnectEx = nullptr;
+	GUID guidConnectEx = WSAID_CONNECTEX;
+	DWORD bytes = 0;
+
+	rc = WSAIoctl(
+		upstreamCtx->socket,
+		SIO_GET_EXTENSION_FUNCTION_POINTER,
+		&guidConnectEx,
+		sizeof(guidConnectEx),
+		&lpfnConnectEx,
+		sizeof(lpfnConnectEx),
+		&bytes,
+		nullptr,
+		nullptr);
+
+	if (rc == SOCKET_ERROR || !lpfnConnectEx)
+	{
+		std::cerr << "Failed to get ConnectEx function pointer" << std::endl;
+		delete ioData;
+		return nullptr;
+	}
+
+	upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+	BOOL ok = lpfnConnectEx(
+		upstreamCtx->socket,
+		(sockaddr *)&addr,
+		sizeof(addr),
+		nullptr,
+		0,
+		nullptr,
+		&ioData->overlapped);
+
+	if (!ok)
+	{
+		int err = WSAGetLastError();
+		if (err != WSA_IO_PENDING)
+		{
+			upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+			std::cerr << "ConnectEx failed: " << err << std::endl;
+			delete ioData;
+			return nullptr;
+		}
+	}
+
+	std::cout << "ConnectEx posted to backend: " << host << ":" << port << std::endl;
+	return ioData;
+}
+
+// Post send operation on upstream socket
+PER_IO_OPERATION_DATA *post_send_upstream(PER_SOCKET_CONTEXT *upstreamCtx, const char *data, DWORD len)
+{
+	auto *ioData = new PER_IO_OPERATION_DATA(OpType::WRITE_UPSTREAM);
+	ioData->buffer = new char[len];
+	memcpy(ioData->buffer, data, len);
+	ioData->wsaBuf.buf = ioData->buffer;
+	ioData->wsaBuf.len = len;
+	ioData->upstreamSocket = upstreamCtx->socket;
+	ioData->upstreamCtx = upstreamCtx;
+	ZeroMemory(&ioData->overlapped, sizeof(ioData->overlapped));
+
+	upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+	DWORD bytesSent = 0;
+	int rc = WSASend(
+		upstreamCtx->socket,
+		&ioData->wsaBuf,
+		1,
+		&bytesSent,
+		0,
+		&ioData->overlapped,
+		nullptr);
+
+	if (rc == SOCKET_ERROR)
+	{
+		int err = WSAGetLastError();
+		if (err != WSA_IO_PENDING)
+		{
+			upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+			std::cerr << "WSASend to upstream failed: " << err << std::endl;
+			delete ioData;
+			return nullptr;
+		}
+	}
+	return ioData;
+}
+
 // when successful g_AcceptEx contains the pointer to the AcceptEx() function
 bool init_acceptex(SOCKET listenSock)
 {
@@ -321,7 +447,7 @@ void initializeLoadBalancer()
 	g_loadBalancer.setDefaultPool("api-servers");
 }
 
-void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
+void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len, HANDLE iocp)
 {
 	std::cout << "Received " << len << " bytes of application data\n"
 			  << std::endl;
@@ -390,36 +516,124 @@ void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len)
 		sockCtx->clientIP,
 		sockCtx->tlsEnabled);
 
-	sockCtx->selectedBackend = backend;
-
-	std::cout << "Forwarded Request" << std::endl;
+	std::cout << "Forwarded Request to backend" << std::endl;
 	std::cout << forwardedRequest << std::endl;
 
-	std::ostringstream response;
-	response << "HTTP/1.1 200 OK\r\n";
-	response << "X-Routed-To: " << backend->getAddress() << "\r\n";
-	response << "Content-Type: text/plain\r\n";
-	response << "Connection: " << (request.isKeepAlive() ? "keep-alive" : "close") << "\r\n";
-	std::string body = "Request routed to backend: " + backend->getAddress() + "\n";
-	response << "Content-Length: " << body.size() << "\r\n";
-	response << "\r\n";
-	response << body;
-
-	std::string responseStr = response.str();
-	sendTLSData(sockCtx, responseStr.c_str(), responseStr.size());
-
-	// Reset parser for keep-alive or close connection
-	if (request.isKeepAlive())
+	// Buffer the request data to send after connection
 	{
-		sockCtx->httpParser.reset();
+		std::unique_lock<std::mutex> lock(sockCtx->clientToUpstreamMutex);
+		sockCtx->clientToUpstreamBuffer.assign(forwardedRequest.begin(), forwardedRequest.end());
 	}
-	else
+
+	if (sockCtx->pairedConnection)
 	{
-		if (!sockCtx->closing.exchange(true))
+		return;
+	}
+
+	PER_SOCKET_CONTEXT *upstreamCtx = new PER_SOCKET_CONTEXT();
+	upstreamCtx->clientIP = "upstream-" + backend->getAddress();
+	upstreamCtx->isBackendConnection = true;
+
+	sockCtx->pairedConnection = upstreamCtx;
+	upstreamCtx->pairedConnection = sockCtx;
+
+	auto upstreamConn = std::make_unique<Upstream::Connection>(backend->host, backend->port);
+
+	if (!upstreamConn->initiateAsyncConnect(iocp))
+	{
+		std::cerr << "Failed to initiate upstream connection" << std::endl;
+		std::string response = HTTP::buildErrorResponse(503, "Failed to connect to backend");
+		sendTLSData(sockCtx, response.c_str(), response.size());
+
+		upstreamCtx->pairedConnection = nullptr;
+		sockCtx->pairedConnection = nullptr;
+		delete upstreamCtx;
+		return;
+	}
+
+	upstreamCtx->socket = upstreamConn->getSocket();
+
+	// Now post ConnectEx to connect to the backend
+	// We need to create the ConnectEx operation with the correct parameters
+	sockaddr_in backendAddr{};
+	backendAddr.sin_family = AF_INET;
+	backendAddr.sin_port = htons(backend->port);
+
+	int rc = inet_pton(AF_INET, backend->host.c_str(), &backendAddr.sin_addr);
+	if (rc != 1)
+	{
+		std::cerr << "Failed to parse backend host: " << backend->host << std::endl;
+		std::string response = HTTP::buildErrorResponse(503, "Backend host invalid");
+		sendTLSData(sockCtx, response.c_str(), response.size());
+		upstreamCtx->pairedConnection = nullptr;
+		sockCtx->pairedConnection = nullptr;
+		delete upstreamCtx;
+		return;
+	}
+
+	// Get ConnectEx function pointer
+	LPFN_CONNECTEX lpfnConnectEx = nullptr;
+	GUID guidConnectEx = WSAID_CONNECTEX;
+	DWORD bytes = 0;
+
+	rc = WSAIoctl(
+		upstreamCtx->socket,
+		SIO_GET_EXTENSION_FUNCTION_POINTER,
+		&guidConnectEx,
+		sizeof(guidConnectEx),
+		&lpfnConnectEx,
+		sizeof(lpfnConnectEx),
+		&bytes,
+		nullptr,
+		nullptr);
+
+	if (rc == SOCKET_ERROR || !lpfnConnectEx)
+	{
+		std::cerr << "Failed to get ConnectEx function pointer" << std::endl;
+		std::string response = HTTP::buildErrorResponse(503, "Internal error");
+		sendTLSData(sockCtx, response.c_str(), response.size());
+		upstreamCtx->pairedConnection = nullptr;
+		sockCtx->pairedConnection = nullptr;
+		delete upstreamCtx;
+		return;
+	}
+
+	// Create IO operation for ConnectEx
+	PER_IO_OPERATION_DATA *connectOp = new PER_IO_OPERATION_DATA(OpType::CONNECT_UPSTREAM);
+	connectOp->upstreamSocket = upstreamCtx->socket;
+	connectOp->upstreamCtx = upstreamCtx;
+
+	upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+	// Post ConnectEx
+	BOOL ok = lpfnConnectEx(
+		upstreamCtx->socket,
+		(sockaddr *)&backendAddr,
+		sizeof(backendAddr),
+		nullptr,
+		0,
+		nullptr,
+		&connectOp->overlapped);
+
+	if (!ok)
+	{
+		int connectErr = WSAGetLastError();
+		if (connectErr != WSA_IO_PENDING)
 		{
-			CancelIoEx((HANDLE)sockCtx->socket, NULL);
+			std::cerr << "ConnectEx failed: " << connectErr << std::endl;
+			std::string response = HTTP::buildErrorResponse(503, "Failed to connect to backend");
+			sendTLSData(sockCtx, response.c_str(), response.size());
+			upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+			upstreamCtx->pairedConnection = nullptr;
+			sockCtx->pairedConnection = nullptr;
+			delete upstreamCtx;
+			delete connectOp;
+			return;
 		}
 	}
+
+	std::cout << "ConnectEx posted to backend: " << backend->getAddress() << std::endl;
+	// ConnectEx will complete asynchronously and will be handled in the worker thread
 }
 
 // handling raw encrypted data from the network, including the first ClientHello message itself
@@ -688,6 +902,9 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	// Store global IOCP handle for use in other functions
+	g_iocp = iocp;
+
 	// associating listen socket with iocp since it will post completion related to the accepted connections
 	CreateIoCompletionPort((HANDLE)listenSocket, iocp, 0, 0);
 
@@ -712,7 +929,8 @@ int main(int argc, char *argv[])
 	{
 		workers.emplace_back([iocp, &running]()
 							 {
-			while (running.load()) {
+			while (running.load())
+			{
 				DWORD bytesTransferred = 0;
 				ULONG_PTR completionKey = 0;
 				LPOVERLAPPED overlapped = nullptr;
@@ -723,39 +941,47 @@ int main(int argc, char *argv[])
 					&bytesTransferred,
 					&completionKey,
 					&overlapped,
-					INFINITE
-				);
+					INFINITE);
 
 				// take the raw bytes in the completionKey and turn it back to a socket context
-				PER_SOCKET_CONTEXT* sockCtx = reinterpret_cast<PER_SOCKET_CONTEXT*>(completionKey);
-				
-				// the overlapped is the first member, so we can take it as the start of the PER_IO_OPERATION_DATA
-				PER_IO_OPERATION_DATA* ioData = reinterpret_cast<PER_IO_OPERATION_DATA*>(overlapped);
+				PER_SOCKET_CONTEXT *sockCtx = reinterpret_cast<PER_SOCKET_CONTEXT *>(completionKey);
 
-				if(!ioData){
+				// the overlapped is the first member, so we can take it as the start of the PER_IO_OPERATION_DATA
+				PER_IO_OPERATION_DATA *ioData = reinterpret_cast<PER_IO_OPERATION_DATA *>(overlapped);
+
+				if (!ioData)
+				{
 					continue;
 				}
 				// checking the result for the GetQueuedCompletionStatus
-				if (!ok) {
+				if (!ok)
+				{
 					DWORD err = GetLastError();
-					if (overlapped == nullptr) {
+					if (overlapped == nullptr)
+					{
 						// could be the condition that the main thread wanted to wake up this worker thread to signal stop
 						// so we break out of the loop
 
-						if (!running.load()) break;
+						if (!running.load())
+							break;
 						// if not, log the warning and continue the next iteration of the while loop
 						std::cerr << "Failed with no overlapped: " << err << std::endl;
 						continue;
 					}
-					else {
-						if(ioData->opType == OpType::READ || ioData->opType == OpType::WRITE){
-							if(sockCtx){
+					else
+					{
+						if (ioData->opType == OpType::READ || ioData->opType == OpType::WRITE)
+						{
+							if (sockCtx)
+							{
 								int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
-								if(remain == 0 && sockCtx->closing.load()) safeClose(sockCtx);
+								if (remain == 0 && sockCtx->closing.load())
+									safeClose(sockCtx);
 							}
 						}
 						// I/O operation failed, if cleanup thread deleted sockCtx, we will delete socket's pending operations' context
-						if (ioData != nullptr) {
+						if (ioData != nullptr)
+						{
 							delete ioData;
 						}
 					}
@@ -764,25 +990,31 @@ int main(int argc, char *argv[])
 				}
 
 				// in case the ok is true but the main thread might call PostQueuedCompletionStatus to signal stop
-				if (overlapped == nullptr) {
-					if (!running.load()) break;
+				if (overlapped == nullptr)
+				{
+					if (!running.load())
+						break;
 					// else continue to next iteration.
 					continue;
 				}
 
-				if(ioData->opType == OpType::ACCEPT){
+				if (ioData->opType == OpType::ACCEPT)
+				{
 					SOCKET accepted = ioData->acceptSocket;
 					DWORD dwErr = 0;
 
-					if(accepted != INVALID_SOCKET){
-						int rc = setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char*)&g_listenSocket, sizeof(g_listenSocket));
-						if(rc == SOCKET_ERROR){
+					if (accepted != INVALID_SOCKET)
+					{
+						int rc = setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char *)&g_listenSocket, sizeof(g_listenSocket));
+						if (rc == SOCKET_ERROR)
+						{
 							print_wsa_error("SO_UPDATE_ACCEPT_CONTEXT_FAILED");
 							closesocket(accepted);
 							delete ioData;
 
-							PER_IO_OPERATION_DATA* next = post_accept(iocp);
-							if(next){
+							PER_IO_OPERATION_DATA *next = post_accept(iocp);
+							if (next)
+							{
 								// Since we donot have a mutex to protect pendingAccepts vector, we cannot push_back this pending accept
 								// to the vector since this can create a race condition. so, we will skip this for now and let kernel handle
 								// the cleanup of pending accepts when shutting down.
@@ -794,17 +1026,16 @@ int main(int argc, char *argv[])
 							g_listenSocket,
 							ioData->buffer,
 							ACCEPT_ADDR_LEN,
-							ACCEPT_ADDR_LEN
-						);
+							ACCEPT_ADDR_LEN);
 
 						// check the rate limit status for the client
-						if(!g_rateLimiter.allowRequest(clientIP)){
+						if (!g_rateLimiter.allowRequest(clientIP))
+						{
 							// get the 429 HTTP response
 							std::string response = RateLimit::build429Response(
 								g_rateLimiter.getRetryAfter(clientIP),
 								g_rateLimiter.getConfig().maxTokens,
-								g_rateLimiter.getRemainingTokens(clientIP)
-							);
+								g_rateLimiter.getRemainingTokens(clientIP));
 
 							// blocking
 							closesocket(accepted);
@@ -814,155 +1045,419 @@ int main(int argc, char *argv[])
 							continue;
 						}
 
-						PER_SOCKET_CONTEXT* sockCtx = new PER_SOCKET_CONTEXT(accepted);
+						PER_SOCKET_CONTEXT *sockCtx = new PER_SOCKET_CONTEXT(accepted);
 						sockCtx->clientIP = clientIP;
 						sockCtx->enableTLS(g_tlsContext.get());
 
-						if(!CreateIoCompletionPort((HANDLE)accepted, iocp, (ULONG_PTR)sockCtx, 0)){
+						if (!CreateIoCompletionPort((HANDLE)accepted, iocp, (ULONG_PTR)sockCtx, 0))
+						{
 							print_wsa_error("associating the accept socket with iocp failed");
 							closesocket(accepted);
 							delete sockCtx;
 							delete ioData;
-							PER_IO_OPERATION_DATA* next = post_accept(iocp);
-							if(next) {
+							PER_IO_OPERATION_DATA *next = post_accept(iocp);
+							if (next)
+							{
 								// same as before, skip since no mutex on the pending accepts vector
 							}
 							continue;
 						}
 
 						// initiate first receive on the new socket
-						PER_IO_OPERATION_DATA* recvOp = post_recv(sockCtx);
-						if(!recvOp){
+						PER_IO_OPERATION_DATA *recvOp = post_recv(sockCtx);
+						if (!recvOp)
+						{
 							std::cerr << "Failed to post initial receive for the accepted socket" << std::endl;
-							if(!sockCtx->closing.exchange(true)){
+							if (!sockCtx->closing.exchange(true))
+							{
 								closesocket(sockCtx->socket);
 								delete sockCtx;
 							}
 						}
-						
+
 						// Prevent the destructor from closing the socket we just handed off
 						ioData->acceptSocket = INVALID_SOCKET;
 					}
 
 					delete ioData;
 					// post another accept
-					PER_IO_OPERATION_DATA* nextAccept = post_accept(iocp);
-					if(nextAccept){
+					PER_IO_OPERATION_DATA *nextAccept = post_accept(iocp);
+					if (nextAccept)
+					{
 						// we can track by pushing it to the pending vector if it is mutex
 					}
 					continue;
 				}
 
+				if (ioData->opType == OpType::CONNECT_UPSTREAM)
+				{
+					PER_SOCKET_CONTEXT *upstreamCtx = ioData->upstreamCtx;
+					PER_SOCKET_CONTEXT *clientCtx = upstreamCtx->pairedConnection;
 
-				// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
-				// Here, we close the socket operations, deallocate memory
-				if (bytesTransferred == 0 && ioData->opType == OpType::READ) {
-					std::cout << "Client disconnected" << std::endl;
+					DWORD err = 0;
+					if (!ok)
+					{
+						err = GetLastError();
+						std::cerr << "ConnectEx failed: " << err << std::endl;
 
-					if(sockCtx->tlsEnabled && sockCtx->tlsConn){
-						sockCtx->tlsConn->shutdown();
-						// sending close notify
-						if(sockCtx->tlsConn->hasNetworkDataPending()){
-							sendTLSPendingData(sockCtx);
-						}
-					}
-
-					if(!sockCtx->closing.exchange(true)){
-						CancelIoEx((HANDLE)sockCtx->socket, NULL);
-					}
-					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
-					if(remain == 0){
-						safeClose(sockCtx);
-					}
-					delete ioData;
-					continue;
-				}
-
-				if (ioData->opType == OpType::READ) {
-					std::cout << "Read " << bytesTransferred << " bytes from client" << std::endl;
-
-					// Process through TLS first (handshake or decrypt)
-					handleTLSRead(sockCtx, ioData->buffer, bytesTransferred);
-
-					
-					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;  //fetch sub return previous value
-					if(remain == 0 && sockCtx->closing.load()){
-						safeClose(sockCtx);
-					}
-
-					if(!sockCtx->closing.load()){
-						PER_IO_OPERATION_DATA* nextRecv = post_recv(sockCtx);
-						if (!nextRecv) {
-							std::cerr << "Failed to post receive, closing client." << std::endl;
-							if(!sockCtx->closing.exchange(true)){
-								CancelIoEx((HANDLE)sockCtx->socket, NULL);
+						if (clientCtx)
+						{
+							std::string response = HTTP::buildErrorResponse(503, "Failed to connect to backend");
+							sendTLSData(clientCtx, response.c_str(), response.size());
+							if (!clientCtx->closing.exchange(true))
+							{
+								CancelIoEx((HANDLE)clientCtx->socket, NULL);
 							}
 						}
+
+						upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+						if (!upstreamCtx->closing.exchange(true))
+						{
+							CancelIoEx((HANDLE)upstreamCtx->socket, NULL);
+						}
+						delete ioData;
+						continue;
 					}
-					delete ioData;
-				}
-				else if (ioData->opType == OpType::WRITE) {
-					std::cout << "Write complete: " << bytesTransferred << std::endl;
-					int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
-					if(remain == 0 && sockCtx -> closing.load()){
-						safeClose(sockCtx);
+
+					std::cout << "Connected to upstream backend" << std::endl;
+
+					// Check if client sent data while we were connecting
+					if (clientCtx)
+					{
+						std::unique_lock<std::mutex> lock(clientCtx->clientToUpstreamMutex);
+
+						if (!clientCtx->clientToUpstreamBuffer.empty())
+						{
+							PER_IO_OPERATION_DATA *sendOp = post_send_upstream(
+								upstreamCtx,
+								clientCtx->clientToUpstreamBuffer.data(),
+								static_cast<DWORD>(clientCtx->clientToUpstreamBuffer.size()));
+
+							if (sendOp)
+							{
+								clientCtx->upstreamSendBusy.store(true);
+								clientCtx->clientToUpstreamBuffer.clear();
+							}
+
+							upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+							delete ioData;
+
+							PER_IO_OPERATION_DATA *recvOp = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
+							recvOp->buffer = new char[BUF_SIZE];
+							recvOp->wsaBuf.buf = recvOp->buffer;
+							recvOp->wsaBuf.len = BUF_SIZE;
+							recvOp->upstreamCtx = upstreamCtx;
+							recvOp->upstreamSocket = upstreamCtx->socket;
+							ZeroMemory(&recvOp->overlapped, sizeof(recvOp->overlapped));
+
+							upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+							DWORD bytesReceived = 0;
+							int rc = WSARecv(
+								upstreamCtx->socket,
+								&recvOp->wsaBuf,
+								1,
+								&bytesReceived,
+								&recvOp->flags,
+								&recvOp->overlapped,
+								nullptr);
+
+							if (rc == SOCKET_ERROR)
+							{
+								int recvErr = WSAGetLastError();
+								if (recvErr != WSA_IO_PENDING)
+								{
+									std::cerr << "WSARecv on upstream failed: " << recvErr << std::endl;
+									upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+									delete recvOp;
+								}
+							}
+							continue;
+						}
+
+						// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
+						// Here, we close the socket operations, deallocate memory
+						if (bytesTransferred == 0 && ioData->opType == OpType::READ)
+						{
+							std::cout << "Client disconnected" << std::endl;
+
+							if (sockCtx->tlsEnabled && sockCtx->tlsConn)
+							{
+								sockCtx->tlsConn->shutdown();
+								// sending close notify
+								if (sockCtx->tlsConn->hasNetworkDataPending())
+								{
+									sendTLSPendingData(sockCtx);
+								}
+							}
+
+							if (!sockCtx->closing.exchange(true))
+							{
+								CancelIoEx((HANDLE)sockCtx->socket, NULL);
+							}
+							int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+							if (remain == 0)
+							{
+								safeClose(sockCtx);
+							}
+							delete ioData;
+							continue;
+						}
+
+						if (ioData->opType == OpType::READ)
+						{
+							std::cout << "Read " << bytesTransferred << " bytes from client" << std::endl;
+
+							// Process through TLS first (handshake or decrypt)
+							handleTLSRead(sockCtx, ioData->buffer, bytesTransferred);
+
+							int remain = sockCtx->pendingIO.fetch_sub(1) - 1; // fetch sub return previous value
+							if (remain == 0 && sockCtx->closing.load())
+							{
+								safeClose(sockCtx);
+							}
+
+							if (!sockCtx->closing.load())
+							{
+								PER_IO_OPERATION_DATA *nextRecv = post_recv(sockCtx);
+								if (!nextRecv)
+								{
+									std::cerr << "Failed to post receive, closing client." << std::endl;
+									if (!sockCtx->closing.exchange(true))
+									{
+										CancelIoEx((HANDLE)sockCtx->socket, NULL);
+									}
+								}
+							}
+							delete ioData;
+						}
+						else if (ioData->opType == OpType::READ_UPSTREAM)
+						{
+							PER_SOCKET_CONTEXT *upstreamCtx = ioData->upstreamCtx;
+							PER_SOCKET_CONTEXT *clientCtx = upstreamCtx->pairedConnection;
+
+							if (bytesTransferred == 0)
+							{
+								std::cout << "Backend disconnected" << std::endl;
+								if (clientCtx && !clientCtx->closing.exchange(true))
+								{
+									CancelIoEx((HANDLE)clientCtx->socket, NULL);
+								}
+								if (!upstreamCtx->closing.exchange(true))
+								{
+									CancelIoEx((HANDLE)upstreamCtx->socket, NULL);
+								}
+								upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+								delete ioData;
+								continue;
+							}
+
+							std::cout << "Read " << bytesTransferred << " bytes from backend" << std::endl;
+
+							// Buffer the data with mutex protection
+							if (clientCtx)
+							{
+								{
+									std::unique_lock<std::mutex> lock(clientCtx->upstreamToClientMutex);
+
+									// Append data to buffer
+									clientCtx->upstreamToClientBuffer.insert(
+										clientCtx->upstreamToClientBuffer.end(),
+										ioData->buffer,
+										ioData->buffer + bytesTransferred);
+
+									// If send is not busy, post send immediately
+									if (!clientCtx->clientSendBusy.load())
+									{
+										if (clientCtx->tlsEnabled)
+										{
+											sendTLSData(clientCtx,
+														clientCtx->upstreamToClientBuffer.data(),
+														clientCtx->upstreamToClientBuffer.size());
+										}
+										else
+										{
+											post_send(clientCtx,
+													  clientCtx->upstreamToClientBuffer.data(),
+													  clientCtx->upstreamToClientBuffer.size());
+										}
+
+										clientCtx->clientSendBusy.store(true);
+										clientCtx->upstreamToClientBuffer.clear();
+									}
+								}
+							}
+
+							upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+
+							if (!upstreamCtx->closing.load())
+							{
+								PER_IO_OPERATION_DATA *nextRecv = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
+								nextRecv->buffer = new char[BUF_SIZE];
+								nextRecv->wsaBuf.buf = nextRecv->buffer;
+								nextRecv->wsaBuf.len = BUF_SIZE;
+								nextRecv->upstreamCtx = upstreamCtx;
+								nextRecv->upstreamSocket = upstreamCtx->socket;
+								ZeroMemory(&nextRecv->overlapped, sizeof(nextRecv->overlapped));
+
+								upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+								DWORD bytesReceived = 0;
+								int rc = WSARecv(
+									upstreamCtx->socket,
+									&nextRecv->wsaBuf,
+									1,
+									&bytesReceived,
+									&nextRecv->flags,
+									&nextRecv->overlapped,
+									nullptr);
+
+								if (rc == SOCKET_ERROR)
+								{
+									int recvErr = WSAGetLastError();
+									if (recvErr != WSA_IO_PENDING)
+									{
+										upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+										delete nextRecv;
+									}
+								}
+							}
+							delete ioData;
+						}
+						else if (ioData->opType == OpType::WRITE)
+						{
+							std::cout << "Write complete to client: " << bytesTransferred << std::endl;
+
+							// Check if there's buffered data from upstream
+							{
+								std::unique_lock<std::mutex> lock(sockCtx->upstreamToClientMutex);
+
+								// Mark send as not busy AFTER acquiring mutex
+								sockCtx->clientSendBusy.store(false);
+
+								// Check if more data in buffer
+								if (!sockCtx->upstreamToClientBuffer.empty())
+								{
+									if (sockCtx->tlsEnabled)
+									{
+										sendTLSData(sockCtx,
+													sockCtx->upstreamToClientBuffer.data(),
+													sockCtx->upstreamToClientBuffer.size());
+									}
+									else
+									{
+										post_send(sockCtx,
+												  sockCtx->upstreamToClientBuffer.data(),
+												  sockCtx->upstreamToClientBuffer.size());
+									}
+
+									sockCtx->clientSendBusy.store(true);
+									sockCtx->upstreamToClientBuffer.clear();
+								}
+							}
+
+							int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+							if (remain == 0 && sockCtx->closing.load())
+							{
+								safeClose(sockCtx);
+							}
+							delete ioData;
+						}
+						else if (ioData->opType == OpType::WRITE_UPSTREAM)
+						{
+							std::cout << "Write to upstream complete: " << bytesTransferred << std::endl;
+
+							PER_SOCKET_CONTEXT *upstreamCtx = ioData->upstreamCtx;
+							PER_SOCKET_CONTEXT *clientCtx = upstreamCtx ? upstreamCtx->pairedConnection : nullptr;
+
+							if (clientCtx)
+							{
+								std::unique_lock<std::mutex> lock(clientCtx->clientToUpstreamMutex);
+
+								// Mark send as not busy AFTER acquiring mutex
+								clientCtx->upstreamSendBusy.store(false);
+
+								// Check if more data in buffer
+								if (!clientCtx->clientToUpstreamBuffer.empty())
+								{
+									PER_IO_OPERATION_DATA *nextSend = post_send_upstream(
+										upstreamCtx,
+										clientCtx->clientToUpstreamBuffer.data(),
+										static_cast<DWORD>(clientCtx->clientToUpstreamBuffer.size()));
+
+									if (nextSend)
+									{
+										clientCtx->upstreamSendBusy.store(true);
+										clientCtx->clientToUpstreamBuffer.clear();
+									}
+								}
+							}
+
+							if (upstreamCtx)
+							{
+								upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+								if (upstreamCtx->pendingIO.load() == 0 && upstreamCtx->closing.load())
+								{
+									safeClose(upstreamCtx);
+								}
+							}
+							delete ioData;
+						}
+						else
+						{
+							std::cerr << "Unknown OpType" << std::endl;
+							delete ioData;
+						}
 					}
+				});
+			}
+
+			// Post initial accepts AFTER worker threads are created
+			int initial_accepts = std::max(4, (int)numWorkers);
+			std::vector<PER_IO_OPERATION_DATA *> pendingAccepts;
+			pendingAccepts.reserve(initial_accepts);
+			for (int i = 0; i < initial_accepts; i++)
+			{
+				PER_IO_OPERATION_DATA *acceptData = post_accept(iocp);
+				if (acceptData)
+					pendingAccepts.push_back(acceptData);
+			}
+
+			std::cout << "Press any key to stop server: ";
+			std::cin.get();
+			std::cout << "Shutting down...";
+
+			running.store(false);
+
+			closesocket(listenSocket);
+
+			// closing
+
+			// post completion to wakeup worker threads.
+			for (size_t i = 0; i < workers.size(); i++)
+			{
+				PostQueuedCompletionStatus(iocp, 0, 0, nullptr);
+			}
+
+			// wait for the threads to complete
+			for (auto &t : workers)
+			{
+				if (t.joinable())
+					t.join();
+			}
+
+			// pendingAccepts cleanup
+			for (PER_IO_OPERATION_DATA *ioData : pendingAccepts)
+			{
+				if (ioData != nullptr)
+				{
 					delete ioData;
 				}
-				else {
-					std::cerr << "Unknown OpType" << std::endl;
-					delete ioData;
-				}
+			}
 
-			} });
-	}
-
-	// Post initial accepts AFTER worker threads are created
-	int initial_accepts = std::max(4, (int)numWorkers);
-	std::vector<PER_IO_OPERATION_DATA *> pendingAccepts;
-	pendingAccepts.reserve(initial_accepts);
-	for (int i = 0; i < initial_accepts; i++)
-	{
-		PER_IO_OPERATION_DATA *acceptData = post_accept(iocp);
-		if (acceptData)
-			pendingAccepts.push_back(acceptData);
-	}
-
-	std::cout << "Press any key to stop server: ";
-	std::cin.get();
-	std::cout << "Shutting down...";
-
-	running.store(false);
-
-	closesocket(listenSocket);
-
-	// closing
-
-	// post completion to wakeup worker threads.
-	for (size_t i = 0; i < workers.size(); i++)
-	{
-		PostQueuedCompletionStatus(iocp, 0, 0, nullptr);
-	}
-
-	// wait for the threads to complete
-	for (auto &t : workers)
-	{
-		if (t.joinable())
-			t.join();
-	}
-
-	// pendingAccepts cleanup
-	for (PER_IO_OPERATION_DATA *ioData : pendingAccepts)
-	{
-		if (ioData != nullptr)
-		{
-			delete ioData;
-		}
-	}
-
-	CloseHandle(iocp);
-	TLS::Context::cleanupLibrary();
-	WSACleanup();
-	std::cout << "Server stopped successfully" << std::endl;
-	return 0;
+			CloseHandle(iocp);
+			TLS::Context::cleanupLibrary();
+			WSACleanup();
+			std::cout << "Server stopped successfully" << std::endl;
+			return 0;
 }
