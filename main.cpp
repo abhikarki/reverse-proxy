@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <thread>
 #include <sstream>
+#include <mutex>
 #include "proxy.h"
 #include "tls/tls_context.h"
 #include "tls/tls_connection.h"
@@ -57,7 +58,14 @@ struct PER_SOCKET_CONTEXT
 
 	std::vector<char> tlsInputBuffer;
 	std::vector<char> tlsOutputBuffer;
-	std::vector<char> appDataBuffer;
+
+	std::vector<char> clientToUpstreamBuffer;
+	std::mutex clientToUpstreamMutex;
+	std::atomic<bool> upstreamSendBusy{false};
+
+	std::vector<char> upstreamToClientBuffer;
+	std::mutex upstreamToClientMutex;
+	std::atomic<bool> clientSendBusy{false};
 
 	HTTP::Parser httpParser;
 	bool isBackendConnection;
@@ -142,7 +150,6 @@ typedef BOOL(PASCAL *LPFN_ACCEPTEX)(
 
 LPFN_ACCEPTEX g_AcceptEx = nullptr;
 SOCKET g_listenSocket = INVALID_SOCKET;
-HANDLE g_iocp = nullptr; // Global IOCP handle for all socket operations
 HANDLE g_iocp = nullptr; // Global IOCP handle for all socket operations
 
 PER_IO_OPERATION_DATA *post_recv(PER_SOCKET_CONTEXT *sockCtx)
@@ -512,6 +519,17 @@ void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len, 
 	std::cout << "Forwarded Request to backend" << std::endl;
 	std::cout << forwardedRequest << std::endl;
 
+	// Buffer the request data to send after connection
+	{
+		std::unique_lock<std::mutex> lock(sockCtx->clientToUpstreamMutex);
+		sockCtx->clientToUpstreamBuffer.assign(forwardedRequest.begin(), forwardedRequest.end());
+	}
+
+	if (sockCtx->pairedConnection)
+	{
+		return;
+	}
+
 	PER_SOCKET_CONTEXT *upstreamCtx = new PER_SOCKET_CONTEXT();
 	upstreamCtx->clientIP = "upstream-" + backend->getAddress();
 	upstreamCtx->isBackendConnection = true;
@@ -534,8 +552,6 @@ void processPlainData(PER_SOCKET_CONTEXT *sockCtx, const char *data, DWORD len, 
 	}
 
 	upstreamCtx->socket = upstreamConn->getSocket();
-
-	upstreamCtx->appDataBuffer.assign(forwardedRequest.begin(), forwardedRequest.end());
 
 	// Now post ConnectEx to connect to the backend
 	// We need to create the ConnectEx operation with the correct parameters
@@ -1105,257 +1121,343 @@ int main(int argc, char *argv[])
 
 					std::cout << "Connected to upstream backend" << std::endl;
 
-					if (!upstreamCtx->appDataBuffer.empty())
+					// Check if client sent data while we were connecting
+					if (clientCtx)
 					{
-						PER_IO_OPERATION_DATA *sendOp = post_send_upstream(upstreamCtx,
-																		   upstreamCtx->appDataBuffer.data(),
-																		   static_cast<DWORD>(upstreamCtx->appDataBuffer.size()));
+						std::unique_lock<std::mutex> lock(clientCtx->clientToUpstreamMutex);
 
-						if (!sendOp)
+						if (!clientCtx->clientToUpstreamBuffer.empty())
 						{
-							std::cerr << "Failed to post send to upstream" << std::endl;
-						}
-					}
+							PER_IO_OPERATION_DATA *sendOp = post_send_upstream(
+								upstreamCtx,
+								clientCtx->clientToUpstreamBuffer.data(),
+								static_cast<DWORD>(clientCtx->clientToUpstreamBuffer.size()));
 
-					upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
-					delete ioData;
+							if (sendOp)
+							{
+								clientCtx->upstreamSendBusy.store(true);
+								clientCtx->clientToUpstreamBuffer.clear();
+							}
 
-					PER_IO_OPERATION_DATA *recvOp = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
-					recvOp->buffer = new char[BUF_SIZE];
-					recvOp->wsaBuf.buf = recvOp->buffer;
-					recvOp->wsaBuf.len = BUF_SIZE;
-					recvOp->upstreamCtx = upstreamCtx;
-					recvOp->upstreamSocket = upstreamCtx->socket;
-					ZeroMemory(&recvOp->overlapped, sizeof(recvOp->overlapped));
-
-					upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
-
-					DWORD bytesReceived = 0;
-					int rc = WSARecv(
-						upstreamCtx->socket,
-						&recvOp->wsaBuf,
-						1,
-						&bytesReceived,
-						&recvOp->flags,
-						&recvOp->overlapped,
-						nullptr);
-
-					if (rc == SOCKET_ERROR)
-					{
-						int recvErr = WSAGetLastError();
-						if (recvErr != WSA_IO_PENDING)
-						{
-							std::cerr << "WSARecv on upstream failed: " << recvErr << std::endl;
 							upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
-							delete recvOp;
+							delete ioData;
+
+							PER_IO_OPERATION_DATA *recvOp = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
+							recvOp->buffer = new char[BUF_SIZE];
+							recvOp->wsaBuf.buf = recvOp->buffer;
+							recvOp->wsaBuf.len = BUF_SIZE;
+							recvOp->upstreamCtx = upstreamCtx;
+							recvOp->upstreamSocket = upstreamCtx->socket;
+							ZeroMemory(&recvOp->overlapped, sizeof(recvOp->overlapped));
+
+							upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+							DWORD bytesReceived = 0;
+							int rc = WSARecv(
+								upstreamCtx->socket,
+								&recvOp->wsaBuf,
+								1,
+								&bytesReceived,
+								&recvOp->flags,
+								&recvOp->overlapped,
+								nullptr);
+
+							if (rc == SOCKET_ERROR)
+							{
+								int recvErr = WSAGetLastError();
+								if (recvErr != WSA_IO_PENDING)
+								{
+									std::cerr << "WSARecv on upstream failed: " << recvErr << std::endl;
+									upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+									delete recvOp;
+								}
+							}
+							continue;
 						}
-					}
-					continue;
-				}
 
-			// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
-			// Here, we close the socket operations, deallocate memory
-			if (bytesTransferred == 0 && ioData->opType == OpType::READ)
-			{
-				std::cout << "Client disconnected" << std::endl;
-
-				if (sockCtx->tlsEnabled && sockCtx->tlsConn)
-				{
-					sockCtx->tlsConn->shutdown();
-					// sending close notify
-					if (sockCtx->tlsConn->hasNetworkDataPending())
-					{
-						sendTLSPendingData(sockCtx);
-					}
-				}
-
-				if (!sockCtx->closing.exchange(true))
-				{
-					CancelIoEx((HANDLE)sockCtx->socket, NULL);
-				}
-				int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
-				if (remain == 0)
-				{
-					safeClose(sockCtx);
-				}
-				delete ioData;
-				continue;
-			}
-
-			if (ioData->opType == OpType::READ)
-			{
-				std::cout << "Read " << bytesTransferred << " bytes from client" << std::endl;
-
-				// Process through TLS first (handshake or decrypt)
-				handleTLSRead(sockCtx, ioData->buffer, bytesTransferred);
-
-				int remain = sockCtx->pendingIO.fetch_sub(1) - 1; // fetch sub return previous value
-				if (remain == 0 && sockCtx->closing.load())
-				{
-					safeClose(sockCtx);
-				}
-
-				if (!sockCtx->closing.load())
-				{
-					PER_IO_OPERATION_DATA *nextRecv = post_recv(sockCtx);
-					if (!nextRecv)
-					{
-						std::cerr << "Failed to post receive, closing client." << std::endl;
-						if (!sockCtx->closing.exchange(true))
+						// if bytesTransferred 0 and operation is read, it means the client closed connection on sending end.
+						// Here, we close the socket operations, deallocate memory
+						if (bytesTransferred == 0 && ioData->opType == OpType::READ)
 						{
-							CancelIoEx((HANDLE)sockCtx->socket, NULL);
+							std::cout << "Client disconnected" << std::endl;
+
+							if (sockCtx->tlsEnabled && sockCtx->tlsConn)
+							{
+								sockCtx->tlsConn->shutdown();
+								// sending close notify
+								if (sockCtx->tlsConn->hasNetworkDataPending())
+								{
+									sendTLSPendingData(sockCtx);
+								}
+							}
+
+							if (!sockCtx->closing.exchange(true))
+							{
+								CancelIoEx((HANDLE)sockCtx->socket, NULL);
+							}
+							int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+							if (remain == 0)
+							{
+								safeClose(sockCtx);
+							}
+							delete ioData;
+							continue;
 						}
-					}
-				}
-				delete ioData;
-			}
-			else if (ioData->opType == OpType::READ_UPSTREAM)
-			{
-				PER_SOCKET_CONTEXT *upstreamCtx = ioData->upstreamCtx;
-				PER_SOCKET_CONTEXT *clientCtx = upstreamCtx->pairedConnection;
 
-				if (bytesTransferred == 0)
-				{
-					std::cout << "Backend disconnected" << std::endl;
-					if (clientCtx && !clientCtx->closing.exchange(true))
-					{
-						CancelIoEx((HANDLE)clientCtx->socket, NULL);
-					}
-					if (!upstreamCtx->closing.exchange(true))
-					{
-						CancelIoEx((HANDLE)upstreamCtx->socket, NULL);
-					}
-					upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
-					delete ioData;
-					continue;
-				}
-
-				std::cout << "Read" << bytesTransferred << " bytes from backend" << std::endl;
-
-				if (clientCtx && clientCtx->tlsEnabled)
-				{
-					sendTLSData(clientCtx, ioData->buffer, bytesTransferred);
-				}
-				else if (clientCtx)
-				{
-					post_send(clientCtx, ioData->buffer, bytesTransferred);
-				}
-
-				upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
-
-				if (!upstreamCtx->closing.load())
-				{
-					PER_IO_OPERATION_DATA *nextRecv = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
-					nextRecv->buffer = new char[BUF_SIZE];
-					nextRecv->wsaBuf.buf = nextRecv->buffer;
-					nextRecv->wsaBuf.len = BUF_SIZE;
-					nextRecv->upstreamCtx = upstreamCtx;
-					nextRecv->upstreamSocket = upstreamCtx->socket;
-					ZeroMemory(&nextRecv->overlapped, sizeof(nextRecv->overlapped));
-
-					upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
-
-					DWORD bytesReceived = 0;
-					int rc = WSARecv(
-						upstreamCtx->socket,
-						&nextRecv->wsaBuf,
-						1,
-						&bytesReceived,
-						&nextRecv->flags,
-						&nextRecv->overlapped,
-						nullptr);
-
-					if (rc == SOCKET_ERROR)
-					{
-						int recvErr = WSAGetLastError();
-						if (recvErr != WSA_IO_PENDING)
+						if (ioData->opType == OpType::READ)
 						{
+							std::cout << "Read " << bytesTransferred << " bytes from client" << std::endl;
+
+							// Process through TLS first (handshake or decrypt)
+							handleTLSRead(sockCtx, ioData->buffer, bytesTransferred);
+
+							int remain = sockCtx->pendingIO.fetch_sub(1) - 1; // fetch sub return previous value
+							if (remain == 0 && sockCtx->closing.load())
+							{
+								safeClose(sockCtx);
+							}
+
+							if (!sockCtx->closing.load())
+							{
+								PER_IO_OPERATION_DATA *nextRecv = post_recv(sockCtx);
+								if (!nextRecv)
+								{
+									std::cerr << "Failed to post receive, closing client." << std::endl;
+									if (!sockCtx->closing.exchange(true))
+									{
+										CancelIoEx((HANDLE)sockCtx->socket, NULL);
+									}
+								}
+							}
+							delete ioData;
+						}
+						else if (ioData->opType == OpType::READ_UPSTREAM)
+						{
+							PER_SOCKET_CONTEXT *upstreamCtx = ioData->upstreamCtx;
+							PER_SOCKET_CONTEXT *clientCtx = upstreamCtx->pairedConnection;
+
+							if (bytesTransferred == 0)
+							{
+								std::cout << "Backend disconnected" << std::endl;
+								if (clientCtx && !clientCtx->closing.exchange(true))
+								{
+									CancelIoEx((HANDLE)clientCtx->socket, NULL);
+								}
+								if (!upstreamCtx->closing.exchange(true))
+								{
+									CancelIoEx((HANDLE)upstreamCtx->socket, NULL);
+								}
+								upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+								delete ioData;
+								continue;
+							}
+
+							std::cout << "Read " << bytesTransferred << " bytes from backend" << std::endl;
+
+							// Buffer the data with mutex protection
+							if (clientCtx)
+							{
+								{
+									std::unique_lock<std::mutex> lock(clientCtx->upstreamToClientMutex);
+
+									// Append data to buffer
+									clientCtx->upstreamToClientBuffer.insert(
+										clientCtx->upstreamToClientBuffer.end(),
+										ioData->buffer,
+										ioData->buffer + bytesTransferred);
+
+									// If send is not busy, post send immediately
+									if (!clientCtx->clientSendBusy.load())
+									{
+										if (clientCtx->tlsEnabled)
+										{
+											sendTLSData(clientCtx,
+														clientCtx->upstreamToClientBuffer.data(),
+														clientCtx->upstreamToClientBuffer.size());
+										}
+										else
+										{
+											post_send(clientCtx,
+													  clientCtx->upstreamToClientBuffer.data(),
+													  clientCtx->upstreamToClientBuffer.size());
+										}
+
+										clientCtx->clientSendBusy.store(true);
+										clientCtx->upstreamToClientBuffer.clear();
+									}
+								}
+							}
+
 							upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
-							delete nextRecv;
+
+							if (!upstreamCtx->closing.load())
+							{
+								PER_IO_OPERATION_DATA *nextRecv = new PER_IO_OPERATION_DATA(OpType::READ_UPSTREAM);
+								nextRecv->buffer = new char[BUF_SIZE];
+								nextRecv->wsaBuf.buf = nextRecv->buffer;
+								nextRecv->wsaBuf.len = BUF_SIZE;
+								nextRecv->upstreamCtx = upstreamCtx;
+								nextRecv->upstreamSocket = upstreamCtx->socket;
+								ZeroMemory(&nextRecv->overlapped, sizeof(nextRecv->overlapped));
+
+								upstreamCtx->pendingIO.fetch_add(1, std::memory_order_relaxed);
+
+								DWORD bytesReceived = 0;
+								int rc = WSARecv(
+									upstreamCtx->socket,
+									&nextRecv->wsaBuf,
+									1,
+									&bytesReceived,
+									&nextRecv->flags,
+									&nextRecv->overlapped,
+									nullptr);
+
+								if (rc == SOCKET_ERROR)
+								{
+									int recvErr = WSAGetLastError();
+									if (recvErr != WSA_IO_PENDING)
+									{
+										upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+										delete nextRecv;
+									}
+								}
+							}
+							delete ioData;
+						}
+						else if (ioData->opType == OpType::WRITE)
+						{
+							std::cout << "Write complete to client: " << bytesTransferred << std::endl;
+
+							// Check if there's buffered data from upstream
+							{
+								std::unique_lock<std::mutex> lock(sockCtx->upstreamToClientMutex);
+
+								// Mark send as not busy AFTER acquiring mutex
+								sockCtx->clientSendBusy.store(false);
+
+								// Check if more data in buffer
+								if (!sockCtx->upstreamToClientBuffer.empty())
+								{
+									if (sockCtx->tlsEnabled)
+									{
+										sendTLSData(sockCtx,
+													sockCtx->upstreamToClientBuffer.data(),
+													sockCtx->upstreamToClientBuffer.size());
+									}
+									else
+									{
+										post_send(sockCtx,
+												  sockCtx->upstreamToClientBuffer.data(),
+												  sockCtx->upstreamToClientBuffer.size());
+									}
+
+									sockCtx->clientSendBusy.store(true);
+									sockCtx->upstreamToClientBuffer.clear();
+								}
+							}
+
+							int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
+							if (remain == 0 && sockCtx->closing.load())
+							{
+								safeClose(sockCtx);
+							}
+							delete ioData;
+						}
+						else if (ioData->opType == OpType::WRITE_UPSTREAM)
+						{
+							std::cout << "Write to upstream complete: " << bytesTransferred << std::endl;
+
+							PER_SOCKET_CONTEXT *upstreamCtx = ioData->upstreamCtx;
+							PER_SOCKET_CONTEXT *clientCtx = upstreamCtx ? upstreamCtx->pairedConnection : nullptr;
+
+							if (clientCtx)
+							{
+								std::unique_lock<std::mutex> lock(clientCtx->clientToUpstreamMutex);
+
+								// Mark send as not busy AFTER acquiring mutex
+								clientCtx->upstreamSendBusy.store(false);
+
+								// Check if more data in buffer
+								if (!clientCtx->clientToUpstreamBuffer.empty())
+								{
+									PER_IO_OPERATION_DATA *nextSend = post_send_upstream(
+										upstreamCtx,
+										clientCtx->clientToUpstreamBuffer.data(),
+										static_cast<DWORD>(clientCtx->clientToUpstreamBuffer.size()));
+
+									if (nextSend)
+									{
+										clientCtx->upstreamSendBusy.store(true);
+										clientCtx->clientToUpstreamBuffer.clear();
+									}
+								}
+							}
+
+							if (upstreamCtx)
+							{
+								upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
+								if (upstreamCtx->pendingIO.load() == 0 && upstreamCtx->closing.load())
+								{
+									safeClose(upstreamCtx);
+								}
+							}
+							delete ioData;
+						}
+						else
+						{
+							std::cerr << "Unknown OpType" << std::endl;
+							delete ioData;
 						}
 					}
-				}
-				delete ioData;
+				});
 			}
-			else if (ioData->opType == OpType::WRITE)
+
+			// Post initial accepts AFTER worker threads are created
+			int initial_accepts = std::max(4, (int)numWorkers);
+			std::vector<PER_IO_OPERATION_DATA *> pendingAccepts;
+			pendingAccepts.reserve(initial_accepts);
+			for (int i = 0; i < initial_accepts; i++)
 			{
-				std::cout << "Write complete: " << bytesTransferred << std::endl;
-				int remain = sockCtx->pendingIO.fetch_sub(1) - 1;
-				if (remain == 0 && sockCtx->closing.load())
+				PER_IO_OPERATION_DATA *acceptData = post_accept(iocp);
+				if (acceptData)
+					pendingAccepts.push_back(acceptData);
+			}
+
+			std::cout << "Press any key to stop server: ";
+			std::cin.get();
+			std::cout << "Shutting down...";
+
+			running.store(false);
+
+			closesocket(listenSocket);
+
+			// closing
+
+			// post completion to wakeup worker threads.
+			for (size_t i = 0; i < workers.size(); i++)
+			{
+				PostQueuedCompletionStatus(iocp, 0, 0, nullptr);
+			}
+
+			// wait for the threads to complete
+			for (auto &t : workers)
+			{
+				if (t.joinable())
+					t.join();
+			}
+
+			// pendingAccepts cleanup
+			for (PER_IO_OPERATION_DATA *ioData : pendingAccepts)
+			{
+				if (ioData != nullptr)
 				{
-					safeClose(sockCtx);
+					delete ioData;
 				}
-				delete ioData;
-			}
-			else if (ioData->opType == OpType::WRITE_UPSTREAM)
-			{
-				std::cout << "Write to upstream complete: " << bytesTransferred << std::endl;
-
-				if (ioData->upstreamCtx)
-				{
-					ioData->upstreamCtx->pendingIO.fetch_sub(1, std::memory_order_relaxed);
-					if (ioData->upstreamCtx->pendingIO.load() == 0 && ioData->upstreamCtx->closing.load())
-					{
-						safeClose(ioData->upstreamCtx);
-					}
-				}
-				delete ioData;
-			}
-			else
-			{
-				std::cerr << "Unknown OpType" << std::endl;
-				delete ioData;
 			}
 
-			} });
-	}
-
-	// Post initial accepts AFTER worker threads are created
-	int initial_accepts = std::max(4, (int)numWorkers);
-	std::vector<PER_IO_OPERATION_DATA *> pendingAccepts;
-	pendingAccepts.reserve(initial_accepts);
-	for (int i = 0; i < initial_accepts; i++)
-	{
-		PER_IO_OPERATION_DATA *acceptData = post_accept(iocp);
-		if (acceptData)
-			pendingAccepts.push_back(acceptData);
-	}
-
-	std::cout << "Press any key to stop server: ";
-	std::cin.get();
-	std::cout << "Shutting down...";
-
-	running.store(false);
-
-	closesocket(listenSocket);
-
-	// closing
-
-	// post completion to wakeup worker threads.
-	for (size_t i = 0; i < workers.size(); i++)
-	{
-		PostQueuedCompletionStatus(iocp, 0, 0, nullptr);
-	}
-
-	// wait for the threads to complete
-	for (auto &t : workers)
-	{
-		if (t.joinable())
-			t.join();
-	}
-
-	// pendingAccepts cleanup
-	for (PER_IO_OPERATION_DATA *ioData : pendingAccepts)
-	{
-		if (ioData != nullptr)
-		{
-			delete ioData;
-		}
-	}
-
-	CloseHandle(iocp);
-	TLS::Context::cleanupLibrary();
-	WSACleanup();
-	std::cout << "Server stopped successfully" << std::endl;
-	return 0;
+			CloseHandle(iocp);
+			TLS::Context::cleanupLibrary();
+			WSACleanup();
+			std::cout << "Server stopped successfully" << std::endl;
+			return 0;
 }
