@@ -69,7 +69,7 @@ struct PER_SOCKET_CONTEXT{
     std::vector<char> tlsOutputBuffer;
     std::vector<char> clientToUpstreamBuffer;
     std::mutex clientToUpstreamMutex;
-    std::atomic<bool> upstreamBusy{false};
+    std::atomic<bool> upstreamSendBusy{false};
     std::vector<char> upstreamToClientBuffer;
     std::mutex upstreamToClientMutex;
     std::atomic<bool> clientSendBusy{false};
@@ -267,7 +267,7 @@ PER_IO_OPERATION_DATA *post_accept(HANDLE iocp){
     ioData->wsaBuf.buf = ioData->buffer;
     ioData->wsaBuf.len = ACCEPT_ADDR_LEN * 2;
 
-    SOCKET acceptSock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0. WSA_FLAG_OVERLAPPED);
+    SOCKET acceptSock = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
 
     if(acceptSock == INVALID_SOCKET){
         print_wsa_error("WSASocket for accept failed");
@@ -350,7 +350,7 @@ void safeClose(PER_SOCKET_CONTEXT *ctx){
 }
 
 
-void initializeLoadBalance(){
+void initializeLoadBalancer(){
     auto &apiPool = g_loadBalancer.createPool("api-servers");
     apiPool.addBackend("127.0.0.1", 3001);
     apiPool.addBackend("127.0.0.1", 3002);
@@ -763,9 +763,9 @@ int main(int argc, char *argv[])
         {
             while (running.load())
             {
-                DWORD          bytesTransferred = 0;
-                ULONG_PTR      completionKey    = 0;
-                LPOVERLAPPED   overlapped       = nullptr;
+                DWORD  bytesTransferred = 0;
+                ULONG_PTR completionKey    = 0;
+                LPOVERLAPPED overlapped       = nullptr;
  
                 BOOL ok = GetQueuedCompletionStatus(
                     iocp,
@@ -774,7 +774,7 @@ int main(int argc, char *argv[])
                     &overlapped,
                     INFINITE);
  
-                PER_SOCKET_CONTEXT    *sockCtx = reinterpret_cast<PER_SOCKET_CONTEXT *>(completionKey);
+                PER_SOCKET_CONTEXT *sockCtx = reinterpret_cast<PER_SOCKET_CONTEXT *>(completionKey);
  
                 PER_IO_OPERATION_DATA *ioData  = reinterpret_cast<PER_IO_OPERATION_DATA *>(overlapped);
  
